@@ -53,7 +53,7 @@ def rotvec_to_6d(rotvec: np.ndarray) -> np.ndarray:
     joints = values.shape[-1] // 3
     flat = values.reshape(-1, 3)
     mat = R.from_rotvec(flat).as_matrix().astype(np.float32)
-    six = mat[:, :, :2].transpose(0, 2, 1).reshape(*prefix, joints * 6)
+    six = mat[:, :2, :].reshape(*prefix, joints * 6)
     return six.astype(np.float32)
 
 
