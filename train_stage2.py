@@ -18,6 +18,14 @@ from datasets.stage2 import Stage2MotionDataset, masked_motion_mse, stage2_colla
 from models.stage2_generator import Stage2Generator
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_SMPLX_MODEL_DIR = PROJECT_ROOT / "human_models"
+
+
+def resolve_project_path(path: Path) -> Path:
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
 def output_root(args: argparse.Namespace) -> Path:
     return Path("outputs") / str(args.run_name)
 
@@ -361,7 +369,7 @@ def render_eval_visualizations(
                     pred_raw[local_idx, :length],
                     dataset=args.dataset,
                     out_dir=sample_dir,
-                    smplx_model_dir=Path(args.smplx_model_dir),
+                    smplx_model_dir=resolve_project_path(Path(args.smplx_model_dir)),
                     render_device=str(args.eval_vis_device),
                     image_size=int(args.eval_vis_image_size),
                     fps=int(args.eval_vis_fps),
@@ -510,7 +518,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-vis-fps", type=int, default=30)
     parser.add_argument("--eval-vis-frame-stride", type=int, default=4)
     parser.add_argument("--eval-vis-device", default="cuda")
-    parser.add_argument("--smplx-model-dir", type=Path, default=Path("/home/taeryunglee/data/human_models"))
+    parser.add_argument("--smplx-model-dir", type=Path, default=DEFAULT_SMPLX_MODEL_DIR)
     parser.add_argument("--no-eval-vis", action="store_true")
     parser.add_argument("--no-tensorboard", action="store_true")
     parser.add_argument("--resume", type=Path, default=None)

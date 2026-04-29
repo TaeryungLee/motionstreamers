@@ -15,12 +15,16 @@ from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SMPLX_MODEL_DIR = Path("/home/taeryunglee/data/human_models")
+DEFAULT_SMPLX_MODEL_DIR = PROJECT_ROOT / "human_models"
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from datasets.stage2 import Stage2MotionDataset
+
+
+def resolve_project_path(path: Path) -> Path:
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def _drop_local_pytorch3d_from_path() -> list[str]:
@@ -349,7 +353,7 @@ def main() -> None:
             item["motion_raw"],
             dataset=args.dataset,
             out_dir=root / f"sample_{idx:03d}",
-            smplx_model_dir=args.smplx_model_dir,
+            smplx_model_dir=resolve_project_path(args.smplx_model_dir),
             render_device=args.render_device,
             image_size=int(args.image_size),
             fps=int(args.fps),
