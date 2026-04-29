@@ -1,0 +1,352 @@
+흠.. 다시 한 번 설계를 해보자.
+
+자 이제 본격적으로 multi-character episode들을 샘플링할거야.
+크게 두 가지 case로 나눔: (1) 일반 object interaction (2) locomotion (lingo 일부 -loco test scene)
+
+- object interaction
+1. loco 제외한 나머지 scene을 순회. 
+2. 일단 character (2, 3, 4) / segment num (4, 5) 정하기.
+3. 각 scene에서, character 수 만큼 sequence를 선택. 이 sequence 안에서 segment num 만큼 연속된 segment를 지정. -> 이게 각 캐릭터마다의 goal sequence가 됨.
+4. Scene 공통의 정보: fixed object list, including interactable body, hand goal (if exists)
+5. 지정된 sequence에서 추출하는 episode-specific 정보:
+portable object의 initial locations (sequence 내에, 첫 번째 pickup 위치, 및 그때의 interactive body/hand goal)
+support (sequence 내에, 해당 및 동일한 종류의 object를 put down하는 장소들. 그때의 interactive body/hand goal)
+6. body/hand goal 및 goal global rotation 추출 방식
+body, hand goal은 affordance map을 생성할 때 썼던, interaction frame의 hand및 body 로부터 추출하는 방식과 동일하게 사용하며, 추가로 해당 segment 정보 내에서 직접 raw데이터셋의 smpl human pose representation 내의 global rotation을 뽑아서 같이 기록해 둠 (body goal이 결국은 cartesian coordinate (i.e. translation) 과 global rotation 둘 모두를 포함하는 것으로). ** 추가로 확인해야 할 부분은, 실제 motion의 autoregressive한 생성을 했을 때, smpl translation과 (motion space 내에서의 cartesian coordinate) body/hand goal이 match하는지 확인해야 함. 예를들어 body translation이 (1,1,1) 인데, 실제로 smpl body model을 forward시켜서 얻어지는 pelvis가 body goal인 (1,1,1)과 matching되는지? canonicalize하는 것도 그렇고, 학습 및 생성단에서 고민해야 하는 부분
+
+- Locomotion
+1. loco scene들을 순회.
+2. sequence 갯수가 적고, segment가 하나인 (move forward 등) 것들이 대부분이더라고? 여기서도 일단 character / goal num 정하기.
+3. 각 sequence를 적당한 길이로 자르기. (600 frames 정도의 길이로, 겹치지 않도록 일부 segment를 추출하기. 하나의 sequence에서 길이만 된다면 여러 개의 segment를 추출하는것도 가능할 듯) -> segment를 각 character에 할당하기.
+4. 각 character마다 할당된 locomotion 안에 body goal을 goal num 갯수만큼 샘플링. 이것들을 도달 목표로 하여 episode 생성.
+
+
+- 공통
+GT의 충돌 여부에 따라서 비충돌/path conflict/goal conflict/both 로 분류.
+
+
+- Affordance 처리한 것 사용? 방안
+일단 기존에 뽑아놨던 정보들은 너무 난잡하긴해.
+뽑는 코드만 재활용하고, 결과는 좀 없애는게 좋겠다.
+일단 여기서 가져와야 하는건 seated/fixed object관련 interaction frame 및 그때의 body/hand goal. + interaction frame정보를 직접 이용해서 raw에서 뽑은 global rotation pose.
+sit, lie down에 대해 현행처럼 body기준 clustering을 해서, 그룹으로 묶어가지고, seatable area를 합집합으로 엮어서 각 그룹별로 2D array로 나타내는 게 필요하겠다.
+fixed object interaction에 대해서도 clustering을 해서 각 cluster별로 body 및 hand goal 합집합 2D array를 뽑을 필요가 있겠다.
+또한, 각 segment별로 body/hand goal 정보를 2D array로 저장할 필요가 있겠다. 이러한 2D array들은 occupancy grid처럼 1grid 간격을 2cm으로 (확인요망) 하면 될듯하다.
+visualization은 <scene이름>/vis/seated, <scene이름>/vis/fixed, <scene이름>/vis/per_segment, 안에 각각 하면 되겠다. 지금처럼 clearance map을 배경으로 하면 되겠다.
+-> 샘플링된 episode들에 대해, 위 affordance 정보를 가지고 physical goal을 주는데 쓰면 되겠다.
+
+
+일단 sanity check 다시한번 하고, 필요한거 검증 한번 더 하고, 그 다음에 multi character episode 생성.
+
+
+
+
+
+- TRUMANS vis 구도 변경
+0ab0329..
+oblique: 위에 공간이 좀 남음. 카메라 각도를 조금만 더 아래쪽을 보도록 내리고, 카메라 조금 더 가까이.
+topview: 카메라 조금 더 가까이.
+0ac97866..
+oblique: 카메라 위치를 조금 더 human working area의 상공쪽으로 이동. (구면을 타고 더 수직 위로, 카메라 각도는 구면의 중점을 계속 바라보는 방향으로)
+topview: 카메라 조금 더 가까이, 위쪽 공간이 남으니 카메라 조금 더 아래로.
+1ㅇ58ㄷ654
+
+
+
+
+일단 결과를 좀 보는게 좋겠긴 한데, 지금 보니까 시작점에서 너무 먼 곳이 찍히곤 하는데.
+nonlinerity가 좀 심한거같긴해.. 각 캐릭터마다 원점으로 고정을 하든 아니면 velocity를 추정하든 해야할듯.
+
+
+
+
+
+
+
+
+
+
+
+
+
+좋아. 지금 1차 실험을 **full-body generation 없이 trajectory planning loop만으로 goal 달성률을 보는 것**으로 잡는 건 합리적이야. 다만 그러려면 “window sample”이 아니라 “episode-level simulation unit”으로 다시 정리해야 함.
+
+**1. 현재 stage1 v2 sampling 기준**
+
+현재 만든 v2 sampling은 대략 이 기준이었어.
+
+```text
+window length = 102 frames
+past = 30
+future = 72
+stride = 8
+ego = move phase only
+others = move/action 상관없이 포함 가능
+max others = 3
+total characters = ego + up to 3 others
+max samples per ego = 32
+character count priority = 4 chars > 3 chars > 2 chars
+others all-window-move ratio target >= 75%
+```
+
+즉 이건 **Stage1 prediction 학습용 window sampling**임.
+
+그런데 지금 하려는 실험은:
+
+```text
+initial world state
++ ego action queue
++ fixed others trajectories / occupancies
+→ closed-loop trajectory planning
+→ ego가 queue goal들을 얼마나 달성하는가
+```
+
+라서 기존 window sample만으로는 부족함. 이제는 **test episode sample**을 따로 만들어야 해.
+
+**2. 새 test episode 생성 기준**
+
+기본적으로는 이렇게 잡는 게 맞아.
+
+```text
+scene split = test
+episode length = 충분히 김
+ego has action queue
+others trajectories are fixed from data
+ego starts before first goal
+```
+
+필수 조건:
+
+```text
+1. ego action queue가 존재해야 함
+2. 각 ego action에 body_goal / goal area가 있어야 함
+3. ego initial position이 scene valid region에 있어야 함
+4. goal area가 local crop에 들어오는 문제가 아니라, global scene 기준으로 정의되어야 함
+5. others는 최대 3명
+6. others slot ordering deterministic
+```
+
+그리고 conflict filtering을 추가.
+
+**3. 추가해야 할 conflict 기준**
+
+네 말대로 others끼리 conflict를 먼저 제거해야 함.
+
+```text
+others-others dynamic conflict:
+  for all t, for all i != j:
+    ||p_i(t) - p_j(t)|| >= 0.5m
+```
+
+이건 strict하게 하면 데이터가 많이 줄 수 있으니, 처음엔 violation ratio 기준도 가능함.
+
+```text
+allowed violation ratio < 1~2%
+```
+
+하지만 test benchmark를 깨끗하게 만들려면 처음엔 strict 추천.
+
+그 다음, ego action goal과 others의 persistent occupancy 충돌 제거.
+
+```text
+for each ego action goal area G:
+  for each other j:
+    other final action goal area not overlap G
+    other final-frame root disk radius 0.25m not overlap G
+```
+
+여기서 네가 말한 “0.5m 지름 원”이면 root disk는:
+
+```text
+radius = 0.25m
+```
+
+그리고 이것도 추가하는 게 좋음.
+
+```text
+ego initial root disk가 any other initial/future persistent occupancy와 겹치지 않음
+ego action goal끼리도 너무 가까운 중복 goal 제거
+goal area가 완전히 obstacle 내부인 이상한 case는 따로 flag
+```
+
+다만 goal이 clearance 밖에 있는 건 무조건 제거하면 안 됨. 우리가 corridor handling을 만든 이유가 있으니까, 제거하지 말고 metadata로 남기는 게 맞음.
+
+```text
+goal_safe / goal_unsafe flag 저장
+```
+
+
+<여기까진 했어>
+아래부터 하면 되고, 그리고 그 전에 Trumans에 대해서 grid search한 게 끝났으니, 일단 그 parameter 쓰면서, goal reaching에 대한 부분을 추가해서 optimizer를 설정하면 될 듯 해.
+
+
+**4. Episode loop 설계**
+
+trajectory-only loop는 이렇게 가면 됨.
+
+```text
+state:
+  ego current root
+  ego current velocity
+  current phase = MOVE / WAIT / ACTION
+  action queue
+  others future trajectory source
+  time index
+```
+
+매 window:
+
+```text
+1. observe current world state
+2. Stage1 predictor로 ego/others future prediction
+3. optimizer로 ego root trajectory 30 frames planning
+4. Phase/Queue manager update
+5. execute root trajectory 일부 frames
+6. update time/current state
+```
+
+full-body action generation 대신 Action phase는 data에서 action trajectory를 가져오거나 단순 occupancy로 처리.
+
+**5. Action phase를 어떻게 대체할지**
+
+1차 실험에서는 action motion 자체가 중요하지 않으니, 이렇게 간소화하면 됨.
+
+```text
+MOVE:
+  optimizer trajectory execute
+
+WAIT:
+  near-stationary trajectory execute
+
+ACTION:
+  ego root를 goal area 내부/근처에 고정
+  action duration만큼 time consume
+  action complete 조건 만족 시 pop queue
+```
+
+만약 “training data에서 action trajectory를 따온다”면 더 자연스럽지만, goal 달성률 실험에서는 꼭 필요하진 않음. 오히려 root만 보면:
+
+```text
+action = stay at goal for required duration
+```
+
+이 더 명확함.
+
+**6. 중요한 문제: optimizer가 goal까지 도달하나?**
+
+현재 optimizer horizon은:
+
+```text
+30 frames = 1 sec
+```
+
+그래서 한 번의 planning window로 goal 도착을 강제하지 않는 게 맞음. 대신 closed-loop에서 매 window마다 goal distance가 줄어야 함.
+
+필요한 건 “terminal goal force”보다 **progress term**이야.
+
+```text
+J_goal =
+  mean distance_to_goal_area(p_t)
++ terminal_weight * distance_to_goal_area(p_T)
+```
+
+그리고 Phase Manager가 도착 판정:
+
+```text
+if distance_to_goal_area(current_pos) < arrival_threshold:
+    switch MOVE -> ACTION
+```
+
+여기서는 `goal_tolerance`가 다시 필요해짐. optimizer cost에는 안 썼지만, loop state transition에는 필요함.
+
+추천:
+
+```text
+arrival_threshold = 0.25~0.35m
+required_hold_frames = maybe 5~10
+```
+
+즉:
+
+```text
+optimizer:
+  goal로 진행하게 함
+
+phase manager:
+  goal 도착 여부를 판정함
+```
+
+이렇게 분리해야 함.
+
+**7. 지금 의논해야 할 핵심 결정들**
+
+우리가 정해야 할 것:
+
+```text
+1. test episode length
+2. action queue 길이
+3. action duration을 실제 데이터에서 쓸지, fixed duration으로 둘지
+4. MOVE window execute length
+   - optimize horizon은 30 frames
+   - 실제 execute는 10/15/30 중 선택
+
+5. arrival threshold
+6. wait timeout
+7. strict sequence vs local reordering
+8. others trajectory를 GT로 고정할지, Stage1 prediction으로 rolling할지
+```
+
+1차 실험 추천은 가장 단순하게:
+
+```text
+others = GT future fixed
+ego planning = Stage1 prediction + optimizer
+execute length = 15 frames
+horizon = 30 frames
+strict queue
+no reordering
+WAIT allowed
+ACTION = fixed root hold at goal
+arrival_threshold = 0.3m
+action duration = dataset segment duration or capped fixed duration
+```
+
+**8. 결론**
+
+진행 순서는 이게 맞아.
+
+```text
+Step 1:
+  trajectory-planning test episode generator 새로 만들기
+
+Step 2:
+  conflict-free filtering 추가
+  - others-others dynamic conflict
+  - ego action goal vs others final persistent occupancy
+  - metadata flags 저장
+
+Step 3:
+  closed-loop trajectory-only simulator 구현
+
+Step 4:
+  metrics:
+    goal success rate
+    average completed actions
+    time-to-goal
+    static collision ratio
+    dynamic collision ratio
+    wait/defer count
+```
+
+이렇게 하면 Stage2 없이도 논문 스토리의 핵심인:
+
+```text
+prediction + planning + phase/queue adaptation이
+populated scene에서 goal 달성률을 높인다
+```
+
+를 먼저 검증할 수 있음.
+
+
+
+Sampling관련해서는 StableMoFusion과 같은 방식대로 해. 걔네는 학습/sample때 몇 step 사용해?
