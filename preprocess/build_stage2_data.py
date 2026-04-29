@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-id", default=None)
     parser.add_argument("--scene-list-file", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_PREPROCESSED_ROOT)
-    parser.add_argument("--history-frames", type=int, default=2)
+    parser.add_argument("--history-frames", type=int, default=5)
     parser.add_argument("--move-future-frames", type=int, default=15)
     parser.add_argument("--action-min-target-frames", type=int, default=30)
     parser.add_argument("--action-max-target-frames", type=int, default=300)

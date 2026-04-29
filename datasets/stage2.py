@@ -139,6 +139,7 @@ class Stage2MotionDataset(Dataset):
         seed: int = 2026,
         max_records: int = 0,
         mmap: bool = True,
+        randomize_offsets: bool | None = None,
     ) -> None:
         if task not in {"move_wait", "action"}:
             raise ValueError(f"task must be move_wait or action, got {task}")
@@ -149,6 +150,7 @@ class Stage2MotionDataset(Dataset):
         self.normalize = bool(normalize)
         self.nb_voxels = int(nb_voxels)
         self.seed = int(seed)
+        self.randomize_offsets = self.split == "train" if randomize_offsets is None else bool(randomize_offsets)
         self.array_cache = ArrayCache(mmap=mmap)
         self.stage2_root = self.root / self.dataset / "stage2"
 
@@ -195,6 +197,9 @@ class Stage2MotionDataset(Dataset):
 
     def _rng(self, index: int) -> random.Random:
         return random.Random((self.seed + 1000003 * int(index)) & 0xFFFFFFFF)
+
+    def _offset_rng(self, index: int):
+        return random if self.randomize_offsets else self._rng(index)
 
     def _read_motion_vector(
         self,
@@ -270,7 +275,7 @@ class Stage2MotionDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[int(index)]
-        rng = self._rng(index)
+        rng = self._offset_rng(index)
         if self.task == "move_wait":
             frames, anchor, history_frames, target_frames = self._sample_move_wait(record, rng)
         else:

@@ -435,6 +435,7 @@ def build_loader(args: argparse.Namespace, split: str, shuffle: bool, max_record
         max_records=max_records,
         nb_voxels=int(args.nb_voxels),
         seed=int(args.seed),
+        randomize_offsets=bool(shuffle),
     )
     loader = DataLoader(
         dataset,
@@ -468,12 +469,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="train")
     parser.add_argument("--eval-split", default="test")
 
-    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--context-dim", type=int, default=256)
-    parser.add_argument("--num-heads", type=int, default=4)
-    parser.add_argument("--num-layers", type=int, default=8)
+    parser.add_argument("--num-heads", type=int, default=8)
+    parser.add_argument("--num-layers", type=int, default=8, help="Kept for StableMoFusion option compatibility; U-Net uses two blocks per stage.")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--num-diffusion-steps", type=int, default=100)
+    parser.add_argument("--text-model-name", default="google/mt5-small")
+    parser.add_argument("--text-max-length", type=int, default=64)
+    parser.add_argument("--text-local-files-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--nb-voxels", type=int, default=32)
     parser.add_argument("--param-loss-weight", type=float, default=1.0)
     parser.add_argument("--root-loss-weight", type=float, default=1.0)
@@ -547,6 +551,9 @@ def main() -> None:
         num_layers=int(args.num_layers),
         num_timesteps=int(args.num_diffusion_steps),
         dropout=float(args.dropout),
+        text_model_name=str(args.text_model_name),
+        text_max_length=int(args.text_max_length),
+        text_local_files_only=bool(args.text_local_files_only),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
