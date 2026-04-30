@@ -338,7 +338,7 @@ def render_eval_visualizations(
     indices = rng.sample(range(num_items), num_vis_candidates)
     vis_loader = DataLoader(
         Subset(dataset, indices),
-        batch_size=int(args.batch_size),
+        batch_size=int(args.eval_vis_batch_size),
         shuffle=False,
         num_workers=int(args.num_workers),
         pin_memory=torch.cuda.is_available(),
@@ -532,6 +532,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-every-steps", type=int, default=5000)
     parser.add_argument("--max-eval-batches", type=int, default=100)
     parser.add_argument("--eval-vis-samples", type=int, default=10)
+    parser.add_argument("--eval-vis-batch-size", type=int, default=10)
     parser.add_argument("--eval-vis-every-steps", type=int, default=1000)
     parser.add_argument("--eval-vis-sampling-steps", type=int, default=25)
     parser.add_argument("--eval-vis-image-size", type=int, default=384)
