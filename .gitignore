@@ -175,3 +175,9 @@ smplx_blender_addon
 tools
 
 __pycache__
+
+*.zip
+ckpts
+dataset
+smpl_models
+vis.blend

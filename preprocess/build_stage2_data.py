@@ -10,7 +10,7 @@ import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PREPROCESSED_ROOT = PROJECT_ROOT / "data" / "preprocessed"
+DEFAULT_PREPROCESSED_ROOT = Path("data") / "preprocessed"
 MOVE_WAIT_GOAL_TYPES = {"walk", "move", "stand_still"}
 
 
@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-list-file", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_PREPROCESSED_ROOT)
     parser.add_argument("--history-frames", type=int, default=5)
-    parser.add_argument("--move-future-frames", type=int, default=15)
+    parser.add_argument("--move-future-frames", type=int, default=21)
     parser.add_argument("--action-min-target-frames", type=int, default=30)
     parser.add_argument("--action-max-target-frames", type=int, default=300)
     parser.add_argument("--action-max-aug-delta", type=int, default=25)

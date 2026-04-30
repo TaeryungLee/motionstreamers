@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PREPROCESSED_ROOT = PROJECT_ROOT / "data" / "preprocessed"
+DEFAULT_PREPROCESSED_ROOT = Path("data") / "preprocessed"
 
 
 def parse_args() -> argparse.Namespace:
@@ -302,37 +302,72 @@ def compute_stats(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def compute_scene_scale_meta(args: argparse.Namespace) -> dict[str, Any]:
+    scenes_root = args.output_root / args.dataset / "scenes_v2"
+    x_half = 3.0
+    z_half = 4.0
+    y_min = 0.0
+    y_max = 2.0
+    num_scenes = 0
+    if scenes_root.exists():
+        for path in scenes_root.glob("*/scene.json"):
+            try:
+                payload = load_json(path)
+                grid = payload.get("grid_meta") or {}
+                x_half = max(x_half, abs(float(grid.get("x_min", -x_half))), abs(float(grid.get("x_max", x_half))))
+                z_half = max(z_half, abs(float(grid.get("z_min", -z_half))), abs(float(grid.get("z_max", z_half))))
+                y_min = min(y_min, float(grid.get("y_min", y_min)))
+                y_max = max(y_max, float(grid.get("y_max", y_max)))
+                num_scenes += 1
+            except Exception:
+                continue
+    return {
+        "dataset": args.dataset,
+        "representation": "canonical_local_smplx_joints28_xyz",
+        "normalization": "scene_extent_affine",
+        "x_scale": float(max(x_half, 1e-6)),
+        "z_scale": float(max(z_half, 1e-6)),
+        "y_center": float((y_min + y_max) * 0.5),
+        "y_scale": float(max((y_max - y_min) * 0.5, 1e-6)),
+        "num_scenes": int(num_scenes),
+    }
+
+
+def mean_std_from_scene_scale(meta: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    joint_mean = np.array([0.0, float(meta["y_center"]), 0.0], dtype=np.float32)
+    joint_std = np.array([float(meta["x_scale"]), float(meta["y_scale"]), float(meta["z_scale"])], dtype=np.float32)
+    return np.tile(joint_mean, 28).astype(np.float32), np.tile(joint_std, 28).astype(np.float32)
+
+
 def main() -> None:
     args = parse_args()
-    result = compute_stats(args)
     stage2_root = args.output_root / args.dataset / "stage2"
-    if args.kind == "all_motion":
-        mean = np.asarray(result["mean"], dtype=np.float32)
-        std = np.asarray(result["std"], dtype=np.float32)
-        stage2_root.mkdir(parents=True, exist_ok=True)
-        mean_path = stage2_root / "motion_mean.npy"
-        std_path = stage2_root / "motion_std.npy"
-        np.save(mean_path, mean)
-        np.save(std_path, std)
-        meta = dict(result)
-        meta.pop("mean", None)
-        meta.pop("std", None)
-        meta.update(
-            {
-                "mean_path": str(mean_path),
-                "std_path": str(std_path),
-                "root_dims": [0, 1, 2],
-                "root_mean": [0.0, 0.0, 0.0],
-                "root_std": [1.0, 1.0, 1.0],
-            }
-        )
-        out_path = stage2_root / "motion_stats_meta.json"
-        write_json(out_path, meta)
-    else:
-        out_path = stage2_root / f"normalization_stats_{args.split}_{args.kind}.json"
-        write_json(out_path, result)
-    print(f"wrote {out_path}")
-    print(f"count={result['count']} dim={result['dim']} records={result['num_records']} skipped={result['skipped']}")
+    stage2_root.mkdir(parents=True, exist_ok=True)
+    meta = compute_scene_scale_meta(args)
+    mean, std = mean_std_from_scene_scale(meta)
+    mean_path = stage2_root / "motion_mean.npy"
+    std_path = stage2_root / "motion_std.npy"
+    coord_path = stage2_root / "joint_coord_norm_meta.json"
+    np.save(mean_path, mean)
+    np.save(std_path, std)
+    write_json(coord_path, meta)
+    stats_meta = dict(meta)
+    stats_meta.update(
+        {
+            "dim": int(mean.shape[0]),
+            "mean_path": str(mean_path),
+            "std_path": str(std_path),
+            "coord_meta_path": str(coord_path),
+            "joint_count": 28,
+            "joint_dim": 3,
+        }
+    )
+    out_path = stage2_root / "motion_stats_meta.json"
+    write_json(out_path, stats_meta)
+    print(f"wrote {coord_path}")
+    print(f"wrote {mean_path}")
+    print(f"wrote {std_path}")
+    print(f"dim={mean.shape[0]} x_scale={meta['x_scale']} y_center={meta['y_center']} y_scale={meta['y_scale']} z_scale={meta['z_scale']}")
 
 
 if __name__ == "__main__":

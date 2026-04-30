@@ -420,26 +420,45 @@ class StableMoFusionUNet1D(nn.Module):
         return out[:, :, :original_frames].transpose(1, 2)
 
 
-class SceneTokenEncoder3D(nn.Module):
-    def __init__(self, in_channels: int = 1, context_dim: int = 256) -> None:
+class SceneTokenEncoderViT(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 64,
+        context_dim: int = 256,
+        image_size: int = 32,
+        patch_size: int = 8,
+        depth: int = 6,
+        heads: int = 8,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv3d(in_channels, 32, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.GELU(),
-            nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.Conv3d(64, context_dim, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(group_count(context_dim), context_dim),
-            nn.GELU(),
+        if image_size % patch_size != 0:
+            raise ValueError("image_size must be divisible by patch_size")
+        self.patch = nn.Conv2d(in_channels, context_dim, kernel_size=patch_size, stride=patch_size)
+        num_patches = (image_size // patch_size) ** 2
+        self.cls = nn.Parameter(torch.randn(1, 1, context_dim) * 0.02)
+        self.pos = nn.Parameter(torch.randn(1, num_patches + 1, context_dim) * 0.02)
+        enc_heads = max(1, min(int(heads), int(context_dim)))
+        while int(context_dim) % enc_heads != 0 and enc_heads > 1:
+            enc_heads -= 1
+        layer = nn.TransformerEncoderLayer(
+            d_model=context_dim,
+            nhead=enc_heads,
+            dim_feedforward=context_dim * 2,
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
-        self.type_embed = nn.Parameter(torch.randn(2, context_dim) * 0.02)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=int(depth))
+        self.norm = nn.LayerNorm(context_dim)
 
-    def forward(self, current: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
-        cur = self.net(current).flatten(2).transpose(1, 2) + self.type_embed[0][None, None]
-        goal_tokens = self.net(goal).flatten(2).transpose(1, 2) + self.type_embed[1][None, None]
-        return torch.cat([cur, goal_tokens], dim=1)
+    def forward(self, scene_occ: torch.Tensor) -> torch.Tensor:
+        tokens = self.patch(scene_occ).flatten(2).transpose(1, 2)
+        cls = self.cls.expand(scene_occ.shape[0], -1, -1).to(tokens.dtype)
+        tokens = torch.cat([cls, tokens], dim=1)
+        tokens = tokens + self.pos[:, : tokens.shape[1]].to(tokens.dtype)
+        return self.norm(self.encoder(tokens))
 
 
 class HistoryEncoder(nn.Module):
@@ -464,17 +483,20 @@ class HistoryEncoder(nn.Module):
 class GoalTokenEncoder(nn.Module):
     def __init__(self, context_dim: int) -> None:
         super().__init__()
-        self.body = nn.Sequential(nn.Linear(4, context_dim), nn.SiLU(), nn.Linear(context_dim, context_dim))
-        self.left = nn.Sequential(nn.Linear(4, context_dim), nn.SiLU(), nn.Linear(context_dim, context_dim))
-        self.right = nn.Sequential(nn.Linear(4, context_dim), nn.SiLU(), nn.Linear(context_dim, context_dim))
-        self.type_embed = nn.Parameter(torch.randn(3, context_dim) * 0.02)
+        self.body = nn.Sequential(nn.Linear(3, context_dim), nn.SiLU(), nn.Linear(context_dim, context_dim))
+        self.hand = nn.Sequential(nn.Linear(3, context_dim), nn.SiLU(), nn.Linear(context_dim, context_dim))
+        self.type_embed = nn.Parameter(torch.randn(2, context_dim) * 0.02)
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        valid = batch["goal_valid"].to(batch["body_goal"].dtype)
-        body = self.body(torch.cat([batch["body_goal"], valid[:, 0:1]], dim=-1)) + self.type_embed[0][None]
-        left = self.left(torch.cat([batch["left_hand_goal"], valid[:, 1:2]], dim=-1)) + self.type_embed[1][None]
-        right = self.right(torch.cat([batch["right_hand_goal"], valid[:, 2:3]], dim=-1)) + self.type_embed[2][None]
-        return torch.stack([body, left, right], dim=1)
+    def forward(self, batch: dict[str, torch.Tensor], include_hand: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        valid = batch["goal_valid"].to(batch["body_goal_cond"].dtype)
+        body = self.body(batch["body_goal_cond"]) + self.type_embed[0][None]
+        tokens = [body]
+        masks = [valid[:, 0] > 0.5]
+        if include_hand:
+            hand = self.hand(batch["hand_goal_cond"]) + self.type_embed[1][None]
+            tokens.append(hand)
+            masks.append(valid[:, 1] > 0.5)
+        return torch.stack(tokens, dim=1), torch.stack(masks, dim=1)
 
 
 class T5TextTokenEncoder(nn.Module):
@@ -559,7 +581,7 @@ class RootPlanFrameEncoder(nn.Module):
         x_t = batch["x_t"]
         batch_size, total_frames = x_t.shape[:2]
         h_len = max(1, int(batch["history_frames"].max().item()))
-        plan = batch["root_plan"].to(dtype=x_t.dtype, device=x_t.device)
+        plan = batch["root_plan_cond"].to(dtype=x_t.dtype, device=x_t.device)
         mask = batch["root_plan_mask"].to(dtype=x_t.dtype, device=x_t.device)
         vel = torch.zeros_like(plan)
         if plan.shape[1] > 1:
@@ -591,7 +613,7 @@ class Stage2BaseGenerator(nn.Module):
         self.base_dim = int(base_dim)
         self.context_dim = int(context_dim)
         self.history = HistoryEncoder(motion_dim, context_dim)
-        self.scene = SceneTokenEncoder3D(1, context_dim)
+        self.scene = SceneTokenEncoderViT(64, context_dim, heads=num_heads, dropout=dropout)
         self.unet = StableMoFusionUNet1D(
             input_dim=motion_dim + int(input_extra_dim),
             output_dim=motion_dim,
@@ -609,7 +631,7 @@ class Stage2BaseGenerator(nn.Module):
 
     def base_context(self, batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
         history_tokens = self.history(batch["motion"], batch["history_frames"])
-        scene_tokens = self.scene(batch["scene_current"], batch["scene_goal"])
+        scene_tokens = self.scene(batch["scene_occ"])
         context = torch.cat([history_tokens, scene_tokens], dim=1)
         return context, full_context_mask(context)
 
@@ -638,9 +660,13 @@ class MoveWaitGen(Stage2BaseGenerator):
             frame_cond_dim=frame_cond_dim,
         )
         self.root_frame = RootPlanFrameEncoder(frame_cond_dim)
+        self.goals = GoalTokenEncoder(context_dim)
 
     def forward(self, batch: dict[str, torch.Tensor], diffusion_t: torch.Tensor) -> dict[str, torch.Tensor]:
-        context, context_mask = self.base_context(batch)
+        base_context, base_mask = self.base_context(batch)
+        goal_tokens, goal_mask = self.goals(batch, include_hand=False)
+        context = torch.cat([base_context, goal_tokens], dim=1)
+        context_mask = torch.cat([base_mask, goal_mask.to(base_mask.device)], dim=1)
         frame_cond = self.root_frame(batch)
         pred = self.unet(batch["x_t"], self.base_extra(batch), context, diffusion_t, context_mask=context_mask, frame_cond=frame_cond)
         return {"x0_hat": pred}
@@ -679,9 +705,8 @@ class ActionGen(Stage2BaseGenerator):
     def forward(self, batch: dict[str, Any], diffusion_t: torch.Tensor) -> dict[str, torch.Tensor]:
         base_context, base_mask = self.base_context(batch)
         text_tokens, text_mask = self.text(batch)
-        goal_tokens = self.goals(batch)
+        goal_tokens, goal_mask = self.goals(batch, include_hand=True)
         context = torch.cat([base_context, text_tokens, goal_tokens], dim=1)
-        goal_mask = full_context_mask(goal_tokens)
         context_mask = torch.cat([base_mask, text_mask.to(base_mask.device), goal_mask], dim=1)
         pred = self.unet(batch["x_t"], self.base_extra(batch), context, diffusion_t, context_mask=context_mask, frame_cond=None)
         return {"x0_hat": pred}

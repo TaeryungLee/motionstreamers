@@ -15,7 +15,9 @@ from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SMPLX_MODEL_DIR = PROJECT_ROOT / "human_models"
+DEFAULT_SMPLX_MODEL_DIR = Path("smpl_models")
+DEFAULT_JOINTS2SMPLX_CKPT = Path("ckpts") / "joints2smplx" / "train_joint2smpl__input_84__hidden_128__all__last.pth"
+JOINTS28_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 34, 40, 49]
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -146,8 +148,13 @@ def motion_to_vertices(
     dataset: str,
     smplx_model_dir: Path,
     device: torch.device,
+    anchor_root: torch.Tensor | None = None,
+    world_to_local: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import smplx
+
+    if int(motion.shape[-1]) == 84:
+        return joints28_motion_to_vertices(motion, smplx_model_dir, device, anchor_root=anchor_root, world_to_local=world_to_local)
 
     modules = load_pytorch3d_modules()
     params = parse_motion_params(motion.to(device), dataset=dataset, modules=modules)
@@ -174,6 +181,70 @@ def motion_to_vertices(
     smpl_model.eval()
     with torch.no_grad():
         out = smpl_model(return_verts=True, **params)
+    faces = torch.as_tensor(np.asarray(smpl_model.faces, dtype=np.int64), dtype=torch.long, device=device)
+    return out.vertices.detach(), faces
+
+
+def local_joints28_to_world(motion: torch.Tensor, anchor_root: torch.Tensor | None, world_to_local: torch.Tensor | None) -> torch.Tensor:
+    joints = motion.float().reshape(motion.shape[0], 28, 3)
+    if anchor_root is None or world_to_local is None:
+        return joints
+    root = anchor_root.to(joints.device, dtype=joints.dtype).reshape(3)
+    rot = world_to_local.to(joints.device, dtype=joints.dtype).reshape(3, 3)
+    offset = torch.tensor([root[0], 0.0, root[2]], dtype=joints.dtype, device=joints.device)
+    return torch.matmul(joints, rot) + offset
+
+
+def joints28_motion_to_vertices(
+    motion: torch.Tensor,
+    smplx_model_dir: Path,
+    device: torch.device,
+    anchor_root: torch.Tensor | None = None,
+    world_to_local: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import smplx
+    from models.joints_to_smplx import JointsToSMPLX, joints_to_smpl
+
+    joints_world = local_joints28_to_world(motion.to(device), anchor_root, world_to_local).reshape(motion.shape[0], -1)
+    model = JointsToSMPLX(input_dim=84, output_dim=132, hidden_dim=128).to(device)
+    ckpt = torch.load(resolve_project_path(DEFAULT_JOINTS2SMPLX_CKPT), map_location=device)
+    model.load_state_dict(ckpt)
+    model.eval()
+    with torch.enable_grad():
+        result = joints_to_smpl(model, joints_world, JOINTS28_INDICES, 1)
+    pose = torch.as_tensor(result[0], dtype=torch.float32, device=device)
+    transl = torch.as_tensor(result[1], dtype=torch.float32, device=device)
+    left_hand = torch.as_tensor(result[2], dtype=torch.float32, device=device)
+    right_hand = torch.as_tensor(result[3], dtype=torch.float32, device=device)
+    smpl_model = smplx.create(
+        str(smplx_model_dir),
+        model_type="smplx",
+        gender="male",
+        ext="npz",
+        num_betas=10,
+        use_pca=False,
+        create_global_orient=True,
+        create_body_pose=True,
+        create_betas=True,
+        create_left_hand_pose=True,
+        create_right_hand_pose=True,
+        create_expression=True,
+        create_jaw_pose=True,
+        create_leye_pose=True,
+        create_reye_pose=True,
+        create_transl=True,
+        batch_size=int(pose.shape[0]),
+    ).to(device)
+    smpl_model.eval()
+    with torch.no_grad():
+        out = smpl_model(
+            transl=transl,
+            global_orient=pose[:, :3],
+            body_pose=pose[:, 3:],
+            left_hand_pose=left_hand,
+            right_hand_pose=right_hand,
+            return_verts=True,
+        )
     faces = torch.as_tensor(np.asarray(smpl_model.faces, dtype=np.int64), dtype=torch.long, device=device)
     return out.vertices.detach(), faces
 
@@ -274,6 +345,8 @@ def render_stage2_pair(
     fps: int = 30,
     frame_stride: int = 1,
     meta: dict[str, Any] | None = None,
+    anchor_root: torch.Tensor | None = None,
+    world_to_local: torch.Tensor | None = None,
 ) -> None:
     device = torch.device(render_device if torch.cuda.is_available() and str(render_device).startswith("cuda") else "cpu")
     stride = max(1, int(frame_stride))
@@ -281,8 +354,8 @@ def render_stage2_pair(
         gt_motion = gt_motion[::stride]
         gen_motion = gen_motion[::stride]
         fps = max(1, int(round(float(fps) / float(stride))))
-    gt_vertices, faces = motion_to_vertices(gt_motion, dataset, smplx_model_dir, device)
-    gen_vertices, _ = motion_to_vertices(gen_motion, dataset, smplx_model_dir, device)
+    gt_vertices, faces = motion_to_vertices(gt_motion, dataset, smplx_model_dir, device, anchor_root=anchor_root, world_to_local=world_to_local)
+    gen_vertices, _ = motion_to_vertices(gen_motion, dataset, smplx_model_dir, device, anchor_root=anchor_root, world_to_local=world_to_local)
     gt_video = render_vertices_video_safe(gt_vertices, faces, out_dir / "gt.mp4", "GT", image_size=image_size, fps=fps, color=(0.2, 0.45, 0.95))
     gen_video = render_vertices_video_safe(gen_vertices, faces, out_dir / "gen.mp4", "Gen", image_size=image_size, fps=fps, color=(0.9, 0.2, 0.2))
     save_side_by_side(gt_video, gen_video, out_dir / "side_by_side.mp4", fps=fps)
@@ -301,13 +374,15 @@ def render_stage2_gt(
     fps: int = 30,
     frame_stride: int = 1,
     meta: dict[str, Any] | None = None,
+    anchor_root: torch.Tensor | None = None,
+    world_to_local: torch.Tensor | None = None,
 ) -> None:
     device = torch.device(render_device if torch.cuda.is_available() and str(render_device).startswith("cuda") else "cpu")
     stride = max(1, int(frame_stride))
     if stride > 1:
         motion = motion[::stride]
         fps = max(1, int(round(float(fps) / float(stride))))
-    vertices, faces = motion_to_vertices(motion, dataset, smplx_model_dir, device)
+    vertices, faces = motion_to_vertices(motion, dataset, smplx_model_dir, device, anchor_root=anchor_root, world_to_local=world_to_local)
     render_vertices_video_safe(vertices, faces, out_dir / "gt.mp4", "GT", image_size=image_size, fps=fps, color=(0.2, 0.45, 0.95))
     if meta is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -359,6 +434,8 @@ def main() -> None:
             fps=int(args.fps),
             frame_stride=int(args.frame_stride),
             meta=meta,
+            anchor_root=item["anchor_root"],
+            world_to_local=item["world_to_local"],
         )
 
 

@@ -1,5 +1,6 @@
 import torch
 import smplx
+import numpy as np
 from constants import *
 from scipy.interpolate import interp1d
 from torch import nn, einsum

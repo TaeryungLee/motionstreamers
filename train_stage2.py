@@ -19,7 +19,7 @@ from models.stage2_generator import Stage2Generator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_SMPLX_MODEL_DIR = PROJECT_ROOT / "human_models"
+DEFAULT_SMPLX_MODEL_DIR = Path("smpl_models")
 
 
 def resolve_project_path(path: Path) -> Path:
@@ -375,6 +375,8 @@ def render_eval_visualizations(
                     fps=int(args.eval_vis_fps),
                     frame_stride=int(args.eval_vis_frame_stride),
                     meta=meta,
+                    anchor_root=batch["anchor_root"][local_idx].detach().cpu(),
+                    world_to_local=batch["world_to_local"][local_idx].detach().cpu(),
                 )
                 saved += 1
             except Exception as exc:
