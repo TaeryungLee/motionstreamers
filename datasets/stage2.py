@@ -208,6 +208,7 @@ class Stage2MotionDataset(Dataset):
             self.records = self.records[: int(max_records)]
         if not self.records:
             raise ValueError(f"empty Stage2 manifest: {manifest_path}")
+        self.expanded_index = self._build_expanded_index()
 
         coord_meta_path = Path(stats_path) if stats_path is not None else self.stage2_root / "joint_coord_norm_meta.json"
         if coord_meta_path.exists():
@@ -228,13 +229,30 @@ class Stage2MotionDataset(Dataset):
         return int(self.motion_mean.shape[0])
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.expanded_index)
 
-    def _rng(self, index: int) -> random.Random:
-        return random.Random((self.seed + 1000003 * int(index)) & 0xFFFFFFFF)
-
-    def _offset_rng(self, index: int):
-        return random if self.randomize_offsets else self._rng(index)
+    def _build_expanded_index(self) -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        for record_idx, record in enumerate(self.records):
+            if self.task == "move_wait":
+                start_min = int(record["target_start_min"])
+                start_max = int(record["target_start_max"])
+                for target_start in range(start_min, start_max + 1):
+                    out.append((record_idx, int(target_start)))
+            else:
+                if bool(record.get("first_segment_exception")):
+                    forced = record.get("forced_target_start")
+                    if forced is not None:
+                        out.append((record_idx, int(forced)))
+                    continue
+                action_start = int(record["action_start"])
+                delta_min = int(record["aug_delta_min"])
+                delta_max = int(record["aug_delta_max"])
+                for delta in range(delta_min, delta_max + 1):
+                    out.append((record_idx, int(action_start - delta)))
+        if not out:
+            raise ValueError(f"empty expanded Stage2 index for {self.dataset} {self.task} {self.split}")
+        return out
 
     def _read_motion_vector(
         self,
@@ -259,22 +277,16 @@ class Stage2MotionDataset(Dataset):
             raise ValueError(f"motion dim mismatch: got {motion.shape[-1]} expected {self.motion_dim}")
         return motion, joints_world[:, 0].astype(np.float32), anchor_root.astype(np.float32), anchor_yaw, world_to_local
 
-    def _sample_move_wait(self, record: dict[str, Any], rng: random.Random) -> tuple[np.ndarray, int, int, int]:
-        target_start = rng.randint(int(record["target_start_min"]), int(record["target_start_max"]))
+    def _sample_move_wait(self, record: dict[str, Any], target_start: int) -> tuple[np.ndarray, int, int, int]:
         H = int(record["history_frames"])
         W = int(record["future_frames"])
         seq_start = int(record["sequence_global_start"])
         local = np.arange(target_start - H, target_start + W, dtype=np.int64)
         return seq_start + local, seq_start + target_start - 1, H, W
 
-    def _sample_action(self, record: dict[str, Any], rng: random.Random) -> tuple[np.ndarray, int, int, int]:
+    def _sample_action(self, record: dict[str, Any], target_start: int) -> tuple[np.ndarray, int, int, int]:
         H = int(record["history_frames"])
         seq_start = int(record["sequence_global_start"])
-        if bool(record.get("first_segment_exception")):
-            target_start = int(record["forced_target_start"])
-        else:
-            delta = rng.randint(int(record["aug_delta_min"]), int(record["aug_delta_max"]))
-            target_start = int(record["action_start"]) - int(delta)
         action_end = int(record["action_end"])
         local = np.arange(target_start - H, action_end + 1, dtype=np.int64)
         return seq_start + local, seq_start + target_start - 1, H, int(action_end - target_start + 1)
@@ -300,12 +312,12 @@ class Stage2MotionDataset(Dataset):
         return _scene_vit_input(current, goal)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        record = self.records[int(index)]
-        rng = self._offset_rng(index)
+        record_index, target_start = self.expanded_index[int(index)]
+        record = self.records[int(record_index)]
         if self.task == "move_wait":
-            frames, anchor, history_frames, target_frames = self._sample_move_wait(record, rng)
+            frames, anchor, history_frames, target_frames = self._sample_move_wait(record, target_start)
         else:
-            frames, anchor, history_frames, target_frames = self._sample_action(record, rng)
+            frames, anchor, history_frames, target_frames = self._sample_action(record, target_start)
 
         motion_raw, root_world, anchor_root, anchor_yaw, world_to_local = self._read_motion_vector(record, frames, anchor)
         target_mask = np.zeros((motion_raw.shape[0],), dtype=np.float32)
@@ -379,7 +391,9 @@ class Stage2MotionDataset(Dataset):
             "task_id": torch.tensor(0 if self.task == "move_wait" else 1, dtype=torch.long),
             "text_id": torch.tensor(stable_hash_bucket(str(record.get("text", ""))), dtype=torch.long),
             "goal_type_id": torch.tensor(stable_hash_bucket(str(record.get("goal_type", ""))), dtype=torch.long),
-            "record_index": torch.tensor(index, dtype=torch.long),
+            "record_index": torch.tensor(record_index, dtype=torch.long),
+            "sample_index": torch.tensor(index, dtype=torch.long),
+            "target_start": torch.tensor(target_start, dtype=torch.long),
             "scene_id": str(record.get("scene_id", "")),
             "sequence_id": str(record.get("sequence_id", "")),
             "segment_id": int(record.get("segment_id", -1)),
