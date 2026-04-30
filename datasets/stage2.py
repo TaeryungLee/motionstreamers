@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import random
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -442,6 +441,8 @@ def stage2_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "text_id",
         "goal_type_id",
         "record_index",
+        "sample_index",
+        "target_start",
     ]
     for key in tensor_keys:
         out[key] = torch.stack([item[key] for item in batch], dim=0)

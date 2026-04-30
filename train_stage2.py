@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from datasets.stage2 import Stage2MotionDataset, masked_motion_mse, stage2_collate_fn
@@ -331,7 +331,22 @@ def render_eval_visualizations(
     saved = 0
     generator = torch.Generator(device=device)
     generator.manual_seed(int(args.seed) + int(step))
-    for batch in loader:
+    dataset = loader.dataset
+    num_items = len(dataset)
+    rng = random.Random(int(args.seed) + int(step))
+    num_vis_candidates = min(num_items, max(int(args.eval_vis_samples), int(args.batch_size)))
+    indices = rng.sample(range(num_items), num_vis_candidates)
+    vis_loader = DataLoader(
+        Subset(dataset, indices),
+        batch_size=int(args.batch_size),
+        shuffle=False,
+        num_workers=int(args.num_workers),
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=stage2_collate_fn,
+        drop_last=False,
+        **worker_kwargs(args),
+    )
+    for batch in vis_loader:
         if saved >= int(args.eval_vis_samples):
             break
         batch = move_to_device(batch, device)
@@ -355,6 +370,9 @@ def render_eval_visualizations(
                 "task": args.task,
                 "step": int(step),
                 "batch_index": int(local_idx),
+                "sample_index": int(batch["sample_index"][local_idx].detach().cpu().item()),
+                "record_index": int(batch["record_index"][local_idx].detach().cpu().item()),
+                "target_start": int(batch["target_start"][local_idx].detach().cpu().item()),
                 "scene_id": batch["scene_id"][local_idx],
                 "sequence_id": batch["sequence_id"][local_idx],
                 "segment_id": int(batch["segment_id"][local_idx]),
