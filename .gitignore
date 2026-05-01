@@ -175,6 +175,7 @@ smplx_blender_addon
 tools
 
 __pycache__
+*.pyc
 
 *.zip
 ckpts

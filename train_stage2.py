@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import random
 import sys
 from datetime import datetime
@@ -20,6 +21,7 @@ from models.stage2_generator import Stage2Generator
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SMPLX_MODEL_DIR = Path("smpl_models")
+FOOT_JOINT_GROUPS = ((7, 10), (8, 11))
 
 
 def resolve_project_path(path: Path) -> Path:
@@ -171,6 +173,59 @@ def root_smooth_loss(pred_raw: torch.Tensor, target_mask: torch.Tensor, valid_ma
     return masked_scalar_mean(values, mask)
 
 
+def foot_sliding_loss(
+    pred_raw: torch.Tensor,
+    target_raw: torch.Tensor,
+    target_mask: torch.Tensor,
+    valid_mask: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mode = str(args.foot_sliding_task_mode)
+    if mode == "off" or float(args.foot_sliding_loss_weight) <= 0.0:
+        zero = pred_raw.new_zeros(())
+        return zero, zero, zero
+    if mode == "move_wait" and str(args.task) != "move_wait":
+        zero = pred_raw.new_zeros(())
+        return zero, zero, zero
+    if pred_raw.shape[-1] < 84 or pred_raw.shape[1] < 2:
+        zero = pred_raw.new_zeros(())
+        return zero, zero, zero
+
+    B, T = pred_raw.shape[:2]
+    pred_joints = pred_raw[..., :84].reshape(B, T, 28, 3)
+    target_joints = target_raw[..., :84].reshape(B, T, 28, 3)
+    foot_idx = torch.tensor(FOOT_JOINT_GROUPS, dtype=torch.long, device=pred_raw.device)
+
+    pred_feet = pred_joints.index_select(2, foot_idx.reshape(-1)).reshape(B, T, 2, 2, 3)
+    target_feet = target_joints.index_select(2, foot_idx.reshape(-1)).reshape(B, T, 2, 2, 3)
+    pred_foot_pos = pred_feet.mean(dim=3)
+    target_foot_pos = target_feet.mean(dim=3)
+
+    target_height = target_feet[..., 1].amin(dim=3)
+    lowest_height = target_height.amin(dim=-1, keepdim=True)
+    height_contact = target_height <= (lowest_height + float(args.foot_contact_height_margin_m))
+
+    target_step = target_foot_pos[:, 1:, :, [0, 2]] - target_foot_pos[:, :-1, :, [0, 2]]
+    target_speed = target_step.norm(dim=-1)
+    contact = (
+        height_contact[:, 1:]
+        & height_contact[:, :-1]
+        & (target_speed <= float(args.foot_contact_vel_threshold_m_per_frame))
+    )
+    frame_mask = (target_mask[:, 1:] * target_mask[:, :-1] * valid_mask[:, 1:] * valid_mask[:, :-1]).to(pred_raw.dtype)
+    mask = frame_mask[:, :, None] * contact.to(pred_raw.dtype)
+    if mask.sum() <= 0:
+        zero = pred_raw.new_zeros(())
+        return zero, zero, zero
+
+    pred_step = pred_foot_pos[:, 1:, :, [0, 2]] - pred_foot_pos[:, :-1, :, [0, 2]]
+    values = pred_step.square().sum(dim=-1)
+    loss = masked_scalar_mean(values, mask)
+    slide_mm = loss.sqrt() * 1000.0
+    contact_ratio = mask.sum() / (frame_mask.sum().clamp_min(1.0) * 2.0)
+    return loss, slide_mm, contact_ratio
+
+
 def transition_loss(pred: torch.Tensor, target: torch.Tensor, pred_raw: torch.Tensor, target_raw: torch.Tensor, batch: dict[str, Any]) -> torch.Tensor:
     B, T = pred.shape[:2]
     h = batch["history_frames"].long().clamp(min=1, max=max(T - 1, 1))
@@ -218,34 +273,27 @@ def body_goal_proxy_loss(pred_raw: torch.Tensor, batch: dict[str, Any]) -> tuple
     return loss, metric
 
 
-def training_step(
-    model: torch.nn.Module,
+def stage2_component_loss(
+    pred: torch.Tensor,
+    x0: torch.Tensor,
+    pred_raw: torch.Tensor,
+    target_raw: torch.Tensor,
     batch: dict[str, Any],
-    sqrt_alpha_bar: torch.Tensor,
-    sqrt_one_minus_alpha_bar: torch.Tensor,
-    motion_mean: torch.Tensor,
-    motion_std: torch.Tensor,
     args: argparse.Namespace,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    x0 = batch["motion"]
-    B = x0.shape[0]
-    t = torch.randint(0, sqrt_alpha_bar.shape[0], (B,), device=x0.device, dtype=torch.long)
-    noise = torch.randn_like(x0)
-    x_t = q_sample(x0, t, noise, sqrt_alpha_bar, sqrt_one_minus_alpha_bar)
-    history = batch["history_mask"].to(x0.dtype)[..., None]
-    x_t = x_t * (1.0 - history) + x0 * history
-    batch = dict(batch)
-    batch["x_t"] = x_t
-    pred = model(batch, diffusion_t=t)["x0_hat"]
-    pred_raw = denormalize_motion(pred, motion_mean, motion_std)
-    target_raw = batch["motion_raw"]
-
     param_loss = masked_motion_mse(pred, x0, batch["target_mask"], batch["valid_mask"])
     root_loss = masked_motion_mse(pred_raw[..., :3], target_raw[..., :3], batch["target_mask"], batch["valid_mask"])
     root_plan_loss = root_plan_tracking_loss(pred_raw, batch)
     vel_loss = root_velocity_loss(pred_raw, target_raw, batch["target_mask"], batch["valid_mask"])
     trans_loss = transition_loss(pred, x0, pred_raw, target_raw, batch)
     smooth_loss = root_smooth_loss(pred_raw, batch["target_mask"], batch["valid_mask"])
+    foot_loss, foot_slide_mm, foot_contact_ratio = foot_sliding_loss(
+        pred_raw,
+        target_raw,
+        batch["target_mask"],
+        batch["valid_mask"],
+        args,
+    )
     body_goal_loss, body_goal_min_dist = body_goal_proxy_loss(pred_raw, batch)
     loss = (
         float(args.param_loss_weight) * param_loss
@@ -254,6 +302,7 @@ def training_step(
         + float(args.root_vel_loss_weight) * vel_loss
         + float(args.transition_loss_weight) * trans_loss
         + float(args.smooth_loss_weight) * smooth_loss
+        + float(args.foot_sliding_loss_weight) * foot_loss
         + float(args.body_goal_loss_weight) * body_goal_loss
     )
 
@@ -266,13 +315,174 @@ def training_step(
             "root_vel_mse_m2_per_frame": float(vel_loss.detach().cpu()),
             "transition_mse": float(trans_loss.detach().cpu()),
             "smooth_mse_m2_per_frame2": float(smooth_loss.detach().cpu()),
+            "foot_sliding_mse_m2_per_frame": float(foot_loss.detach().cpu()),
             "body_goal_proxy_mse_m2": float(body_goal_loss.detach().cpu()),
             "root_rmse_mm": float(root_loss.detach().sqrt().cpu() * 1000.0),
             "root_plan_rmse_mm": float(root_plan_loss.detach().sqrt().cpu() * 1000.0),
             "root_vel_rmse_mm_per_frame": float(vel_loss.detach().sqrt().cpu() * 1000.0),
+            "foot_sliding_mm_per_frame": float(foot_slide_mm.detach().cpu()),
+            "foot_contact_ratio": float(foot_contact_ratio.detach().cpu()),
             "body_goal_proxy_min_dist_mm": float(body_goal_min_dist.detach().cpu() * 1000.0),
             "param_rmse": float(param_loss.detach().sqrt().cpu()),
         }
+    return loss, metrics
+
+
+def rollout_forcing_weight(args: argparse.Namespace, global_step: int) -> float:
+    if not bool(args.rollout_forcing):
+        return 0.0
+    target = float(args.rollout_forcing_weight)
+    warmup = max(0, int(args.rollout_forcing_warmup_steps))
+    if warmup <= 0:
+        return target
+    return target * min(1.0, max(0.0, float(global_step) / float(warmup)))
+
+
+def _offset_from_anchor(anchor_root: torch.Tensor) -> torch.Tensor:
+    offset = anchor_root.new_zeros(anchor_root.shape)
+    offset[..., 0] = anchor_root[..., 0]
+    offset[..., 2] = anchor_root[..., 2]
+    return offset
+
+
+def _local_to_world(points: torch.Tensor, anchor_root: torch.Tensor, world_to_local: torch.Tensor) -> torch.Tensor:
+    return points @ world_to_local[:, None, :, :] + _offset_from_anchor(anchor_root)[:, None, None, :]
+
+
+def _world_to_local(points: torch.Tensor, anchor_root: torch.Tensor, world_to_local: torch.Tensor) -> torch.Tensor:
+    centered = points - _offset_from_anchor(anchor_root)[:, None, None, :]
+    return centered @ world_to_local.transpose(1, 2)[:, None, :, :]
+
+
+def build_rollout_forcing_batch(
+    batch: dict[str, Any],
+    pred_raw: torch.Tensor,
+    motion_mean: torch.Tensor,
+    motion_std: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any] | None, float]:
+    if str(args.task) != "move_wait" or "rollout_valid" not in batch:
+        return None, 0.0
+    valid = batch["rollout_valid"].to(device=pred_raw.device) > 0.5
+    if valid.sum() <= 0:
+        return None, 0.0
+    idx = valid.nonzero(as_tuple=False).flatten()
+    out: dict[str, Any] = {
+        "motion": batch["rollout_motion"][idx].clone(),
+        "motion_raw": batch["rollout_motion_raw"][idx].clone(),
+        "target_mask": batch["rollout_target_mask"][idx],
+        "history_mask": batch["rollout_history_mask"][idx],
+        "action_time": batch["rollout_action_time"][idx],
+        "valid_mask": batch["rollout_valid_mask"][idx],
+        "root_plan": batch["rollout_root_plan"][idx],
+        "root_plan_cond": batch["rollout_root_plan_cond"][idx],
+        "root_plan_mask": batch["rollout_root_plan_mask"][idx],
+        "body_goal": batch["rollout_body_goal"][idx],
+        "hand_goal": batch["rollout_hand_goal"][idx],
+        "body_goal_cond": batch["rollout_body_goal_cond"][idx],
+        "hand_goal_cond": batch["rollout_hand_goal_cond"][idx],
+        "goal_valid": batch["rollout_goal_valid"][idx],
+        "scene_occ": batch["rollout_scene_occ"][idx],
+        "anchor_root": batch["rollout_anchor_root"][idx],
+        "anchor_yaw": batch["rollout_anchor_yaw"][idx],
+        "world_to_local": batch["rollout_world_to_local"][idx],
+        "length": batch["rollout_length"][idx],
+        "history_frames": batch["rollout_history_frames"][idx],
+        "target_frames": batch["rollout_target_frames"][idx],
+        "task_id": batch["task_id"][idx],
+    }
+
+    pred_valid = pred_raw.detach()[idx]
+    history_frames = out["history_frames"].long()
+    stride = int(args.rollout_forcing_stride_frames)
+    pred_local_segments = []
+    for row in range(pred_valid.shape[0]):
+        h = int(history_frames[row].item())
+        start = int(stride)
+        end = min(start + h, pred_valid.shape[1])
+        segment = pred_valid[row, start:end, :84].reshape(end - start, 28, 3)
+        if segment.shape[0] < h:
+            pad = segment.new_zeros((h - segment.shape[0], 28, 3))
+            segment = torch.cat([segment, pad], dim=0)
+        pred_local_segments.append(segment)
+    pred_a_local = torch.stack(pred_local_segments, dim=0)
+    pred_world = _local_to_world(pred_a_local, batch["anchor_root"][idx], batch["world_to_local"][idx])
+    pred_b_local = _world_to_local(pred_world, out["anchor_root"], out["world_to_local"]).reshape(pred_world.shape[0], pred_world.shape[1], -1)
+
+    for row in range(out["motion_raw"].shape[0]):
+        h = int(history_frames[row].item())
+        out["motion_raw"][row, :h, :84] = pred_b_local[row, :h]
+    out["motion"] = (out["motion_raw"] - motion_mean.view(1, 1, -1)) / motion_std.view(1, 1, -1)
+    return out, float(valid.float().mean().detach().cpu())
+
+
+def forward_diffusion_loss(
+    model: torch.nn.Module,
+    batch: dict[str, Any],
+    sqrt_alpha_bar: torch.Tensor,
+    sqrt_one_minus_alpha_bar: torch.Tensor,
+    motion_mean: torch.Tensor,
+    motion_std: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float], torch.Tensor]:
+    x0 = batch["motion"]
+    B = x0.shape[0]
+    t = torch.randint(0, sqrt_alpha_bar.shape[0], (B,), device=x0.device, dtype=torch.long)
+    noise = torch.randn_like(x0)
+    x_t = q_sample(x0, t, noise, sqrt_alpha_bar, sqrt_one_minus_alpha_bar)
+    history = batch["history_mask"].to(x0.dtype)[..., None]
+    x_t = x_t * (1.0 - history) + x0 * history
+    batch = dict(batch)
+    batch["x_t"] = x_t
+    pred = model(batch, diffusion_t=t)["x0_hat"]
+    pred_raw = denormalize_motion(pred, motion_mean, motion_std)
+    loss, metrics = stage2_component_loss(pred, x0, pred_raw, batch["motion_raw"], batch, args)
+    return loss, metrics, pred_raw
+
+
+def training_step(
+    model: torch.nn.Module,
+    batch: dict[str, Any],
+    sqrt_alpha_bar: torch.Tensor,
+    sqrt_one_minus_alpha_bar: torch.Tensor,
+    motion_mean: torch.Tensor,
+    motion_std: torch.Tensor,
+    args: argparse.Namespace,
+    global_step: int = 0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    loss, metrics, pred_raw = forward_diffusion_loss(
+        model,
+        batch,
+        sqrt_alpha_bar,
+        sqrt_one_minus_alpha_bar,
+        motion_mean,
+        motion_std,
+        args,
+    )
+    metrics["base_loss"] = metrics["loss"]
+    weight = rollout_forcing_weight(args, global_step)
+    metrics["rollout_weight"] = float(weight)
+    metrics["rollout_valid_ratio"] = 0.0
+    metrics["rollout_loss"] = 0.0
+    if weight > 0.0:
+        rollout_batch, valid_ratio = build_rollout_forcing_batch(batch, pred_raw, motion_mean, motion_std, args)
+        metrics["rollout_valid_ratio"] = float(valid_ratio)
+        if rollout_batch is not None:
+            rollout_loss, rollout_metrics, _ = forward_diffusion_loss(
+                model,
+                rollout_batch,
+                sqrt_alpha_bar,
+                sqrt_one_minus_alpha_bar,
+                motion_mean,
+                motion_std,
+                args,
+            )
+            loss = loss + float(weight) * rollout_loss
+            metrics["rollout_loss"] = float(rollout_loss.detach().cpu())
+            for key in ["root_rmse_mm", "root_plan_rmse_mm", "foot_sliding_mm_per_frame", "foot_contact_ratio"]:
+                if key in rollout_metrics:
+                    metrics[f"rollout_{key}"] = float(rollout_metrics[key])
+    metrics["loss"] = float(loss.detach().cpu())
     return loss, metrics
 
 
@@ -288,6 +498,7 @@ def evaluate(
     motion_std: torch.Tensor,
     amp_dtype: torch.dtype,
     amp_enabled: bool,
+    global_step: int = 0,
 ) -> dict[str, float]:
     model.eval()
     sums: dict[str, float] = {}
@@ -297,7 +508,7 @@ def evaluate(
             break
         batch = move_to_device(batch, device)
         with autocast_context(device, amp_dtype, amp_enabled):
-            _, metrics = training_step(model, batch, sqrt_alpha_bar, sqrt_one_minus_alpha_bar, motion_mean, motion_std, args)
+            _, metrics = training_step(model, batch, sqrt_alpha_bar, sqrt_one_minus_alpha_bar, motion_mean, motion_std, args, global_step=global_step)
         for key, value in metrics.items():
             sums[key] = sums.get(key, 0.0) + float(value)
         count += 1
@@ -379,6 +590,7 @@ def render_eval_visualizations(
                 "goal_type": batch["goal_type"][local_idx],
                 "text": batch["text"][local_idx],
                 "length": length,
+                "fit_smooth_weight": float(args.eval_vis_fit_smooth_weight),
             }
             sample_dir = out_root / f"sample_{saved:03d}"
             try:
@@ -395,6 +607,7 @@ def render_eval_visualizations(
                     meta=meta,
                     anchor_root=batch["anchor_root"][local_idx].detach().cpu(),
                     world_to_local=batch["world_to_local"][local_idx].detach().cpu(),
+                    fit_smooth_weight=float(args.eval_vis_fit_smooth_weight),
                 )
                 saved += 1
             except Exception as exc:
@@ -407,6 +620,7 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scaler: Any,
+    scheduler: Any,
     args: argparse.Namespace,
     epoch: int,
     global_step: int,
@@ -419,6 +633,7 @@ def save_checkpoint(
         {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None and hasattr(scheduler, "state_dict") else None,
             "scaler": scaler.state_dict() if hasattr(scaler, "state_dict") else None,
             "epoch": int(epoch),
             "global_step": int(global_step),
@@ -434,6 +649,7 @@ def load_checkpoint(
     path: Path,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None,
+    scheduler: Any | None,
     scaler: Any | None,
     device: torch.device,
 ) -> tuple[int, int, float | None]:
@@ -441,9 +657,30 @@ def load_checkpoint(
     model.load_state_dict(ckpt["model"])
     if optimizer is not None and ckpt.get("optimizer") is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
+    if scheduler is not None and ckpt.get("scheduler") is not None and hasattr(scheduler, "load_state_dict"):
+        scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None and ckpt.get("scaler") is not None and hasattr(scaler, "load_state_dict"):
         scaler.load_state_dict(ckpt["scaler"])
     return int(ckpt.get("epoch", 0)), int(ckpt.get("global_step", 0)), ckpt.get("best_metric")
+
+
+def build_lr_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer, total_steps: int):
+    if str(args.lr_scheduler) == "none":
+        return None
+    warmup = max(0, int(args.lr_warmup_steps))
+    total = max(1, int(total_steps))
+    min_ratio = float(args.min_lr_ratio)
+
+    def lr_lambda(step: int) -> float:
+        current = int(step)
+        if warmup > 0 and current < warmup:
+            return max(float(current + 1) / float(warmup), 1.0e-8)
+        denom = max(1, total - warmup)
+        progress = min(max(float(current - warmup) / float(denom), 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 def worker_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -513,11 +750,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root-vel-loss-weight", type=float, default=0.5)
     parser.add_argument("--transition-loss-weight", type=float, default=0.5)
     parser.add_argument("--smooth-loss-weight", type=float, default=0.05)
+    parser.add_argument("--foot-sliding-loss-weight", type=float, default=1.0)
+    parser.add_argument("--foot-sliding-task-mode", choices=["off", "move_wait", "all"], default="move_wait")
+    parser.add_argument("--foot-contact-height-margin-m", type=float, default=0.03)
+    parser.add_argument("--foot-contact-vel-threshold-m-per-frame", type=float, default=0.015)
+    parser.add_argument("--rollout-forcing", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--rollout-forcing-weight", type=float, default=0.5)
+    parser.add_argument("--rollout-forcing-warmup-steps", type=int, default=4000)
+    parser.add_argument("--rollout-forcing-stride-frames", type=int, default=15)
     parser.add_argument("--body-goal-loss-weight", type=float, default=0.5)
 
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr-scheduler", choices=["none", "warmup_cosine"], default="warmup_cosine")
+    parser.add_argument("--lr-warmup-steps", type=int, default=2000)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.05)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
 
@@ -538,6 +786,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-vis-image-size", type=int, default=384)
     parser.add_argument("--eval-vis-fps", type=int, default=30)
     parser.add_argument("--eval-vis-frame-stride", type=int, default=4)
+    parser.add_argument("--eval-vis-fit-smooth-weight", type=float, default=0.1)
     parser.add_argument("--eval-vis-device", default="cuda")
     parser.add_argument("--smplx-model-dir", type=Path, default=DEFAULT_SMPLX_MODEL_DIR)
     parser.add_argument("--no-eval-vis", action="store_true")
@@ -585,6 +834,8 @@ def main() -> None:
         text_local_files_only=bool(args.text_local_files_only),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    total_steps = max(1, len(train_loader) * int(args.epochs))
+    scheduler = build_lr_scheduler(args, optimizer, total_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
     writer = build_summary_writer(args)
     sqrt_alpha_bar, sqrt_one_minus_alpha_bar = diffusion_schedule(int(args.num_diffusion_steps), device)
@@ -594,12 +845,20 @@ def main() -> None:
     start_epoch = 0
     global_step = 0
     best_metric: float | None = None
+    best_filename = "best.pt"
     if args.resume is not None:
-        start_epoch, global_step, best_metric = load_checkpoint(args.resume, model, optimizer, scaler, device)
-        logger.write(f"resumed from {args.resume}: epoch={start_epoch} step={global_step} best={best_metric}")
+        start_epoch, global_step, loaded_best_metric = load_checkpoint(args.resume, model, optimizer, scheduler, scaler, device)
+        best_filename = "best_aftter_resume.pt"
+        logger.write(
+            f"resumed from {args.resume}: epoch={start_epoch} step={global_step} "
+            f"previous_best={loaded_best_metric}; reset resume best -> {best_filename}"
+        )
 
     precision = f"amp_{args.amp_dtype}" if amp_enabled else "fp32"
-    logger.write(f"training dataset={args.dataset} task={args.task} batch={args.batch_size} workers={args.num_workers} precision={precision}")
+    logger.write(
+        f"training dataset={args.dataset} task={args.task} batch={args.batch_size} workers={args.num_workers} "
+        f"precision={precision} lr_scheduler={args.lr_scheduler} total_steps={total_steps}"
+    )
 
     for epoch in range(start_epoch, int(args.epochs)):
         model.train()
@@ -609,14 +868,26 @@ def main() -> None:
             batch = move_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, amp_dtype, amp_enabled):
-                loss, metrics = training_step(model, batch, sqrt_alpha_bar, sqrt_one_minus_alpha_bar, motion_mean, motion_std, args)
+                loss, metrics = training_step(
+                    model,
+                    batch,
+                    sqrt_alpha_bar,
+                    sqrt_one_minus_alpha_bar,
+                    motion_mean,
+                    motion_std,
+                    args,
+                    global_step=global_step,
+                )
             scaler.scale(loss).backward()
             if float(args.grad_clip) > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
             scaler.step(optimizer)
             scaler.update()
-            pbar.set_postfix(loss=f"{metrics['loss']:.4f}", root_mm=f"{metrics['root_rmse_mm']:.1f}")
+            if scheduler is not None:
+                scheduler.step()
+            metrics["lr"] = float(optimizer.param_groups[0]["lr"])
+            pbar.set_postfix(loss=f"{metrics['loss']:.4f}", root_mm=f"{metrics['root_rmse_mm']:.1f}", foot_mm=f"{metrics['foot_sliding_mm_per_frame']:.1f}")
 
             if global_step % int(args.log_every_steps) == 0:
                 write_scalars(writer, "train", metrics, global_step)
@@ -632,13 +903,14 @@ def main() -> None:
                     motion_std,
                     amp_dtype,
                     amp_enabled,
+                    global_step=global_step,
                 )
                 write_scalars(writer, "eval", eval_metrics, global_step)
                 logger.write(f"eval step={global_step} {json.dumps(eval_metrics, sort_keys=True)}")
                 metric = eval_metrics.get("loss")
                 if metric is not None and (best_metric is None or float(metric) < float(best_metric)):
                     best_metric = float(metric)
-                    path = save_checkpoint(model, optimizer, scaler, args, epoch, global_step, best_metric, "best.pt")
+                    path = save_checkpoint(model, optimizer, scaler, scheduler, args, epoch, global_step, best_metric, best_filename)
                     logger.write(f"saved best checkpoint {path} metric={best_metric:.6f}")
                 if int(args.eval_vis_every_steps) > 0 and global_step % int(args.eval_vis_every_steps) == 0:
                     render_eval_visualizations(
@@ -656,10 +928,10 @@ def main() -> None:
                 model.train()
 
             if global_step % int(args.checkpoint_every_steps) == 0:
-                path = save_checkpoint(model, optimizer, scaler, args, epoch, global_step, best_metric, "latest.pt")
+                path = save_checkpoint(model, optimizer, scaler, scheduler, args, epoch, global_step, best_metric, "latest.pt")
                 logger.write(f"saved latest checkpoint {path}")
 
-        path = save_checkpoint(model, optimizer, scaler, args, epoch + 1, global_step, best_metric, "latest.pt")
+        path = save_checkpoint(model, optimizer, scaler, scheduler, args, epoch + 1, global_step, best_metric, "latest.pt")
         logger.write(f"epoch end epoch={epoch} global_step={global_step} latest={path}")
 
     if writer is not None:

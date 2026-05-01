@@ -27,7 +27,7 @@ class JointsToSMPLX(nn.Module):
         return self.layers(x)
 
 
-def optimize_smpl(pose_pred, joints, joints_ind, hand_pca=45):
+def optimize_smpl(pose_pred, joints, joints_ind, hand_pca=45, smooth_weight=0.1):
     device = joints.device
     len = joints.shape[0]
 
@@ -67,14 +67,17 @@ def optimize_smpl(pose_pred, joints, joints_ind, hand_pca=45):
                                  )
         joints_output = smpl_output.joints[:, joints_ind].reshape(len, -1, 3)
         vertices_output = smpl_output.vertices[:, ::10].detach().cpu().numpy()
-        loss = loss_fn(joints[:, :], joints_output[:, :])
+        match_loss = loss_fn(joints[:, :], joints_output[:, :])
+        if len >= 3 and float(smooth_weight) > 0.0:
+            acc = joints_output[2:] - 2.0 * joints_output[1:-1] + joints_output[:-2]
+            smooth_loss = acc.square().mean()
+        else:
+            smooth_loss = match_loss.new_zeros(())
+        loss = match_loss + float(smooth_weight) * smooth_loss
         # loss = torch.mean((joints - joints_output) ** 2 * weights)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
-        print(loss.item())
-
 
 
     #left_hand = left_hand @ left_hand_components[:hand_pca]
@@ -83,7 +86,7 @@ def optimize_smpl(pose_pred, joints, joints_ind, hand_pca=45):
     return pose_input.detach().cpu().numpy(), transl.detach().cpu().numpy(), left_hand.detach().cpu().numpy(), right_hand.detach().cpu().numpy(), vertices_output
 
 
-def joints_to_smpl(model, joints, joints_ind, interp_s):
+def joints_to_smpl(model, joints, joints_ind, interp_s, smooth_weight=0.1):
     joints = interpolate_joints(joints, scale=interp_s)
     # joints = interpolate_joints(joints, scale=0.33)
     # joints = interpolate_joints(joints, scale=interp_s * 3)
@@ -98,7 +101,12 @@ def joints_to_smpl(model, joints, joints_ind, interp_s):
     pose_pred = pose_pred.reshape(-1, 6)
     pose_pred = T.matrix_to_axis_angle(T.rotation_6d_to_matrix(pose_pred)).reshape(input_len, -1)
     # pose_pred = pose_pred[:seq_len]
-    pose_output, transl, left_hand, right_hand, vertices = optimize_smpl(pose_pred, joints, joints_ind)
+    pose_output, transl, left_hand, right_hand, vertices = optimize_smpl(
+        pose_pred,
+        joints,
+        joints_ind,
+        smooth_weight=smooth_weight,
+    )
 
     transl = trans_np - np.array(pelvis_shift) + transl
 

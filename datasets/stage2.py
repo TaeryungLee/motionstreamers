@@ -16,6 +16,7 @@ DEFAULT_PREPROCESSED_ROOT = Path("data") / "preprocessed"
 JOINTS28_COUNT = 28
 JOINTS28_DIM = JOINTS28_COUNT * 3
 ROOT_PLAN_FRAMES = 21
+ROLLOUT_STRIDE_FRAMES = 15
 
 
 def repo_path(path_str: str | None) -> Path | None:
@@ -366,7 +367,7 @@ class Stage2MotionDataset(Dataset):
         body_goal_cond = normalize_xyz(body_goal_local[None], self.coord_norm_meta)[0]
         hand_goal_cond = normalize_xyz(hand_goal_local[None], self.coord_norm_meta)[0]
 
-        return {
+        item = {
             "motion": torch.from_numpy(norm_motion.astype(np.float32)),
             "motion_raw": torch.from_numpy(motion_raw.astype(np.float32)),
             "target_mask": torch.from_numpy(target_mask),
@@ -399,6 +400,91 @@ class Stage2MotionDataset(Dataset):
             "goal_type": str(record.get("goal_type", "")),
             "text": str(record.get("text", "")),
         }
+
+        if self.task == "move_wait":
+            rollout_valid = int(target_start + ROLLOUT_STRIDE_FRAMES <= int(record["target_start_max"]))
+            if rollout_valid:
+                rollout_target_start = int(target_start + ROLLOUT_STRIDE_FRAMES)
+                r_frames, r_anchor, r_history_frames, r_target_frames = self._sample_move_wait(record, rollout_target_start)
+                r_motion_raw, r_root_world, r_anchor_root, r_anchor_yaw, r_world_to_local = self._read_motion_vector(record, r_frames, r_anchor)
+                r_target_mask = np.zeros((r_motion_raw.shape[0],), dtype=np.float32)
+                r_target_mask[int(r_history_frames) :] = 1.0
+                r_history_mask = 1.0 - r_target_mask
+                r_action_time = np.zeros((r_motion_raw.shape[0],), dtype=np.float32)
+                r_endpoint_world = r_root_world[-1]
+                r_body_goal_local = (
+                    canonicalize_points(body_goal_world[None], r_anchor_root, r_world_to_local)[0]
+                    if body_goal_world is not None
+                    else np.zeros((3,), dtype=np.float32)
+                )
+                r_hand_goal_local = (
+                    canonicalize_points(hand_goal_world[None], r_anchor_root, r_world_to_local)[0]
+                    if hand_goal_world is not None
+                    else np.zeros((3,), dtype=np.float32)
+                )
+                r_scene_occ = self._scene_tokens(record, r_anchor_root, r_world_to_local, r_endpoint_world, r_endpoint_world)
+                r_norm_motion = (r_motion_raw - self.motion_mean[None]) / self.motion_std[None] if self.normalize else r_motion_raw
+                r_root_plan = r_motion_raw[int(r_history_frames) :, :3].copy()
+                r_root_plan_mask = np.ones((r_root_plan.shape[0],), dtype=np.float32)
+                if r_root_plan.shape[0] < ROOT_PLAN_FRAMES:
+                    pad = np.zeros((ROOT_PLAN_FRAMES - r_root_plan.shape[0], 3), dtype=np.float32)
+                    r_root_plan = np.concatenate([r_root_plan, pad], axis=0)
+                    r_root_plan_mask = np.concatenate([r_root_plan_mask, np.zeros((pad.shape[0],), dtype=np.float32)], axis=0)
+                elif r_root_plan.shape[0] > ROOT_PLAN_FRAMES:
+                    r_root_plan = r_root_plan[:ROOT_PLAN_FRAMES]
+                    r_root_plan_mask = r_root_plan_mask[:ROOT_PLAN_FRAMES]
+                r_root_plan_cond = normalize_xyz(r_root_plan, self.coord_norm_meta)
+                r_body_goal_cond = normalize_xyz(r_body_goal_local[None], self.coord_norm_meta)[0]
+                r_hand_goal_cond = normalize_xyz(r_hand_goal_local[None], self.coord_norm_meta)[0]
+            else:
+                rollout_target_start = int(target_start + ROLLOUT_STRIDE_FRAMES)
+                r_motion_raw = np.zeros_like(motion_raw, dtype=np.float32)
+                r_norm_motion = np.zeros_like(norm_motion, dtype=np.float32)
+                r_target_mask = np.zeros_like(target_mask, dtype=np.float32)
+                r_history_mask = np.zeros_like(history_mask, dtype=np.float32)
+                r_action_time = np.zeros_like(action_time, dtype=np.float32)
+                r_root_plan = np.zeros((ROOT_PLAN_FRAMES, 3), dtype=np.float32)
+                r_root_plan_cond = np.zeros((ROOT_PLAN_FRAMES, 3), dtype=np.float32)
+                r_root_plan_mask = np.zeros((ROOT_PLAN_FRAMES,), dtype=np.float32)
+                r_body_goal_local = np.zeros((3,), dtype=np.float32)
+                r_hand_goal_local = np.zeros((3,), dtype=np.float32)
+                r_body_goal_cond = np.zeros((3,), dtype=np.float32)
+                r_hand_goal_cond = np.zeros((3,), dtype=np.float32)
+                r_scene_occ = np.zeros_like(scene_occ, dtype=np.float32)
+                r_anchor_root = np.zeros((3,), dtype=np.float32)
+                r_anchor_yaw = 0.0
+                r_world_to_local = np.eye(3, dtype=np.float32)
+                r_history_frames = int(history_frames)
+                r_target_frames = int(target_frames)
+
+            item.update(
+                {
+                    "rollout_valid": torch.tensor(float(rollout_valid), dtype=torch.float32),
+                    "rollout_motion": torch.from_numpy(r_norm_motion.astype(np.float32)),
+                    "rollout_motion_raw": torch.from_numpy(r_motion_raw.astype(np.float32)),
+                    "rollout_target_mask": torch.from_numpy(r_target_mask.astype(np.float32)),
+                    "rollout_history_mask": torch.from_numpy(r_history_mask.astype(np.float32)),
+                    "rollout_action_time": torch.from_numpy(r_action_time.astype(np.float32)),
+                    "rollout_root_plan": torch.from_numpy(r_root_plan.astype(np.float32)),
+                    "rollout_root_plan_cond": torch.from_numpy(r_root_plan_cond.astype(np.float32)),
+                    "rollout_root_plan_mask": torch.from_numpy(r_root_plan_mask.astype(np.float32)),
+                    "rollout_body_goal": torch.from_numpy(r_body_goal_local.astype(np.float32)),
+                    "rollout_hand_goal": torch.from_numpy(r_hand_goal_local.astype(np.float32)),
+                    "rollout_body_goal_cond": torch.from_numpy(r_body_goal_cond.astype(np.float32)),
+                    "rollout_hand_goal_cond": torch.from_numpy(r_hand_goal_cond.astype(np.float32)),
+                    "rollout_goal_valid": torch.tensor([body_goal_valid, hand_goal_valid], dtype=torch.float32),
+                    "rollout_scene_occ": torch.from_numpy(r_scene_occ.astype(np.float32)),
+                    "rollout_anchor_root": torch.from_numpy(r_anchor_root.astype(np.float32)),
+                    "rollout_anchor_yaw": torch.tensor(float(r_anchor_yaw), dtype=torch.float32),
+                    "rollout_world_to_local": torch.from_numpy(r_world_to_local.astype(np.float32)),
+                    "rollout_length": torch.tensor(r_motion_raw.shape[0], dtype=torch.long),
+                    "rollout_history_frames": torch.tensor(int(r_history_frames), dtype=torch.long),
+                    "rollout_target_frames": torch.tensor(int(r_target_frames), dtype=torch.long),
+                    "rollout_target_start": torch.tensor(int(rollout_target_start), dtype=torch.long),
+                }
+            )
+
+        return item
 
 
 def _pad_tensor(value: torch.Tensor, length: int) -> torch.Tensor:
@@ -446,6 +532,34 @@ def stage2_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     for key in tensor_keys:
         out[key] = torch.stack([item[key] for item in batch], dim=0)
+    if "rollout_motion" in batch[0]:
+        rollout_max_len = max(int(item["rollout_motion"].shape[0]) for item in batch)
+        for key in {"rollout_motion", "rollout_motion_raw", "rollout_target_mask", "rollout_history_mask", "rollout_action_time"}:
+            out[key] = torch.stack([_pad_tensor(item[key], rollout_max_len) for item in batch], dim=0)
+        rollout_valid_mask = torch.zeros((len(batch), rollout_max_len), dtype=torch.float32)
+        for idx, item in enumerate(batch):
+            rollout_valid_mask[idx, : int(item["rollout_motion"].shape[0])] = 1.0
+        out["rollout_valid_mask"] = rollout_valid_mask
+        for key in [
+            "rollout_valid",
+            "rollout_root_plan",
+            "rollout_root_plan_cond",
+            "rollout_root_plan_mask",
+            "rollout_body_goal",
+            "rollout_hand_goal",
+            "rollout_body_goal_cond",
+            "rollout_hand_goal_cond",
+            "rollout_goal_valid",
+            "rollout_scene_occ",
+            "rollout_anchor_root",
+            "rollout_anchor_yaw",
+            "rollout_world_to_local",
+            "rollout_length",
+            "rollout_history_frames",
+            "rollout_target_frames",
+            "rollout_target_start",
+        ]:
+            out[key] = torch.stack([item[key] for item in batch], dim=0)
     for key in ["scene_id", "sequence_id", "segment_id", "goal_type", "text"]:
         out[key] = [item[key] for item in batch]
     return out

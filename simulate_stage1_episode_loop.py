@@ -62,11 +62,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames-per-goal", type=int, default=300)
     parser.add_argument("--action-hold-frames", type=int, default=60)
     parser.add_argument("--interrupt-distance-m", type=float, default=0.25)
+    parser.add_argument("--wait-release-distance-m", type=float, default=0.80)
     parser.add_argument("--collision-distance-m", type=float, default=0.50)
     parser.add_argument("--wait-ring-radius-m", type=float, default=0.80)
     parser.add_argument("--wait-hold-frames", type=int, default=30)
     parser.add_argument("--max-wait-frames", type=int, default=180)
-    parser.add_argument("--w-goal", type=float, default=1.0)
+    parser.add_argument("--w-goal", type=float, default=None)
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--save-trajectories", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-plots", action=argparse.BooleanOptionalAction, default=False)
@@ -235,7 +236,8 @@ def load_optimizer_config(path: Path, args: argparse.Namespace) -> Stage1Optimiz
     values = dict(payload.get("config") or payload)
     allowed = Stage1OptimizerV2Config.__dataclass_fields__.keys()
     config = Stage1OptimizerV2Config(**{key: value for key, value in values.items() if key in allowed})
-    config.w_goal = float(args.w_goal)
+    if args.w_goal is not None:
+        config.w_goal = float(args.w_goal)
     config.horizon = int(args.horizon)
     setattr(config, "speed_bound_mps", float(values.get("speed_bound_mps", 1.0)))
     return config
@@ -382,6 +384,127 @@ def move_towards(current_xy: np.ndarray, target_xy: np.ndarray, frames: int, spe
     return out
 
 
+def run_optimized_move_window(
+    scene: SceneInfo,
+    model: Stage1Predictor,
+    opt_config: Stage1OptimizerV2Config,
+    device: torch.device,
+    args: argparse.Namespace,
+    ego_history: list[np.ndarray],
+    others_clips: list[CharacterClip],
+    sim_t: int,
+    target_xy: np.ndarray,
+    segment_type: str,
+    goal_type: Any,
+    segments: list[dict[str, Any]],
+    opt_debug: list[dict[str, float]],
+    action_goal_xy: np.ndarray | None = None,
+) -> tuple[int, float, bool]:
+    batch, scene_crop, others_future_abs = build_predictor_batch(
+        scene,
+        np.asarray(ego_history, dtype=np.float32),
+        others_clips,
+        sim_t,
+        target_xy,
+        int(args.past_frames),
+        int(args.future_frames),
+        device,
+    )
+    with torch.no_grad():
+        sample = model.sample(batch, num_steps=int(args.num_sampling_steps), deterministic=True)
+    pred = sample["x0_hat"]
+    pred_ego = pred[:, 0, : int(args.horizon)]
+    pred_others = pred[:, 1:, : int(args.horizon)]
+    others_valid = batch["entity_valid"][:, 1:]
+    current_xy = np.asarray(ego_history[-1], dtype=np.float32)
+    target_rel_xy = np.asarray(target_xy - current_xy, dtype=np.float32)
+    goal_map_point, _ = clipped_goal_for_map(target_rel_xy)
+    goal_map = make_gaussian_map(
+        goal_map_point[None],
+        MODEL_MAP_SIZE[0],
+        MODEL_MAP_SIZE[1],
+        LOCAL_RESOLUTION,
+        LOCAL_ORIGIN,
+        sigma=0.25,
+    )
+    static_fields = build_stage1_static_fields_v2(
+        scene_crop[1],
+        goal_map,
+        opt_config,
+        start_xy=(0.0, 0.0),
+    )
+    goal_distance = goal_distance_field_to_body_goal(target_rel_xy)
+    hist = np.asarray(ego_history, dtype=np.float32)
+    if len(hist) >= 2:
+        current_vel = (hist[-1] - hist[-2]) / float(opt_config.dt)
+    else:
+        current_vel = np.zeros((2,), dtype=np.float32)
+    opt_rel, metrics = optimize_stage1_trajectory_batch_v2(
+        pred_ego=pred_ego,
+        pred_others=pred_others,
+        others_valid=others_valid,
+        distance_fields=torch.from_numpy(scene_crop[1][None]).float().to(device),
+        static_fields=torch.from_numpy(static_fields["final_static"][None]).float().to(device),
+        goal_distance_fields=torch.from_numpy(goal_distance[None]).float().to(device),
+        gt_ego=torch.zeros((1, int(args.horizon), 2), dtype=torch.float32, device=device),
+        gt_others=torch.from_numpy((others_future_abs[:, : int(args.horizon)] - current_xy[None, None])[None]).float().to(device),
+        current_vel_xy=torch.from_numpy(current_vel[None]).float().to(device),
+        speed_bound=float(opt_config.speed_bound_mps),
+        config=opt_config,
+    )
+    opt_debug.append(metrics)
+    opt_abs = opt_rel[0].detach().cpu().numpy() + current_xy[None]
+    execute = min(int(args.execute_frames), len(opt_abs))
+    window_start = len(ego_history) - 1
+    for point in opt_abs[:execute]:
+        ego_history.append(point.astype(np.float32))
+        sim_t += 1
+    final_dist = float(np.linalg.norm(ego_history[-1] - target_xy))
+    window_reached = final_dist <= float(args.arrival_radius_m)
+    window_end = len(ego_history) - 1
+    segment: dict[str, Any] = {
+        "type": str(segment_type),
+        "goal_type": goal_type,
+        "start": int(window_start),
+        "end": int(window_end),
+        "reached_in_window": bool(window_reached),
+        "final_distance_m": float(final_dist),
+        "goal_xy": [float(target_xy[0]), float(target_xy[1])],
+    }
+    if action_goal_xy is not None:
+        segment["action_goal_xy"] = [float(action_goal_xy[0]), float(action_goal_xy[1])]
+    segments.append(segment)
+    return sim_t, final_dist, window_reached
+
+
+def append_wait_hold_segment(
+    ego_history: list[np.ndarray],
+    sim_t: int,
+    frames: int,
+    wait_point: np.ndarray,
+    action_goal_xy: np.ndarray,
+    goal_type: Any,
+    segments: list[dict[str, Any]],
+) -> tuple[int, int]:
+    start = len(ego_history) - 1
+    for _ in range(int(frames)):
+        ego_history.append(wait_point.astype(np.float32))
+        sim_t += 1
+    end = len(ego_history) - 1
+    if end > start:
+        segments.append(
+            {
+                "type": "WAIT",
+                "goal_type": goal_type,
+                "start": int(start),
+                "end": int(end),
+                "goal_xy": [float(wait_point[0]), float(wait_point[1])],
+                "action_goal_xy": [float(action_goal_xy[0]), float(action_goal_xy[1])],
+            }
+        )
+    return sim_t, max(0, end - start)
+
+
 def compute_collisions(ego_xy: np.ndarray, others_clips: list[CharacterClip], collision_distance: float) -> dict[str, float]:
     if len(ego_xy) == 0:
         return {"dynamic_collision_ratio": 0.0, "min_dynamic_distance_m": float("nan")}
@@ -440,6 +563,10 @@ def plot_episode_overview(
     for seg in segments:
         if seg.get("type") == "MOVE":
             color = "#e41a1c"
+        elif seg.get("type") == "MOVE_TO_WAIT":
+            color = "#984ea3"
+        elif seg.get("type") == "MOVE_BACK_TO_GOAL":
+            color = "#ff7f00"
         elif seg.get("type") == "ACTION":
             color = "#377eb8"
         else:
@@ -506,6 +633,20 @@ def plot_window(
         ax.scatter([others_xy[idx, start, 0]], [others_xy[idx, start, 1]], color=color, s=12, marker="o", zorder=5)
         ax.scatter([others_xy[idx, end, 0]], [others_xy[idx, end, 1]], color=color, s=18, marker="^", zorder=5)
     ax.scatter([goal_xy[0]], [goal_xy[1]], marker="*", s=70, c="#ffd400", edgecolors="black", linewidths=0.5, zorder=5, label="goal")
+    if "action_goal_xy" in segment:
+        action_goal = np.asarray(segment["action_goal_xy"], dtype=np.float32)
+        if float(np.linalg.norm(action_goal - goal_xy)) > 1e-4:
+            ax.scatter(
+                [action_goal[0]],
+                [action_goal[1]],
+                marker="P",
+                s=48,
+                c="#00bcd4",
+                edgecolors="black",
+                linewidths=0.4,
+                zorder=5,
+                label="action goal",
+            )
     if start < len(ego_xy):
         ax.scatter([ego_xy[start, 0]], [ego_xy[start, 1]], c="red", s=16, marker="o", zorder=6, label="ours start")
     if end < len(ego_xy):
@@ -548,7 +689,6 @@ def simulate_episode(
     opt_debug: list[dict[str, float]] = []
     segments: list[dict[str, Any]] = []
 
-    speed_bound = float(opt_config.speed_bound_mps)
     while queue and sim_t < int(args.max_frames_per_goal) * max(1, len(ego_clip.goals)) + 500:
         goal = queue.pop(0)
         goal_xy = body_goal_xy(goal)
@@ -566,72 +706,20 @@ def simulate_episode(
                 if float(np.linalg.norm(current - goal_xy)) <= float(args.arrival_radius_m):
                     status = "move_reached"
                     break
-                batch, scene_crop, others_future_abs = build_predictor_batch(
+                sim_t, final_dist, window_reached = run_optimized_move_window(
                     scene,
-                    np.asarray(ego_history, dtype=np.float32),
+                    model,
+                    opt_config,
+                    device,
+                    args,
+                    ego_history,
                     others_clips,
                     sim_t,
                     goal_xy,
-                    int(args.past_frames),
-                    int(args.future_frames),
-                    device,
-                )
-                with torch.no_grad():
-                    sample = model.sample(batch, num_steps=int(args.num_sampling_steps), deterministic=True)
-                pred = sample["x0_hat"]
-                pred_ego = pred[:, 0, : int(args.horizon)]
-                pred_others = pred[:, 1:, : int(args.horizon)]
-                others_valid = batch["entity_valid"][:, 1:]
-                current_xy = np.asarray(ego_history[-1], dtype=np.float32)
-                goal_rel_xy = goal_xy - current_xy
-                goal_map_point, _ = clipped_goal_for_map(goal_rel_xy)
-                goal_map = make_gaussian_map(goal_map_point[None], MODEL_MAP_SIZE[0], MODEL_MAP_SIZE[1], LOCAL_RESOLUTION, LOCAL_ORIGIN, sigma=0.25)
-                static_fields = build_stage1_static_fields_v2(
-                    scene_crop[1],
-                    goal_map,
-                    opt_config,
-                    start_xy=(0.0, 0.0),
-                )
-                goal_distance = goal_distance_field_to_body_goal(goal_rel_xy)
-                hist = np.asarray(ego_history, dtype=np.float32)
-                if len(hist) >= 2:
-                    current_vel = (hist[-1] - hist[-2]) / float(opt_config.dt)
-                else:
-                    current_vel = np.zeros((2,), dtype=np.float32)
-                opt_rel, metrics = optimize_stage1_trajectory_batch_v2(
-                    pred_ego=pred_ego,
-                    pred_others=pred_others,
-                    others_valid=others_valid,
-                    distance_fields=torch.from_numpy(scene_crop[1][None]).float().to(device),
-                    static_fields=torch.from_numpy(static_fields["final_static"][None]).float().to(device),
-                    goal_distance_fields=torch.from_numpy(goal_distance[None]).float().to(device),
-                    gt_ego=torch.zeros((1, int(args.horizon), 2), dtype=torch.float32, device=device),
-                    gt_others=torch.from_numpy((others_future_abs[:, : int(args.horizon)] - current_xy[None, None])[None]).float().to(device),
-                    current_vel_xy=torch.from_numpy(current_vel[None]).float().to(device),
-                    speed_bound=speed_bound,
-                    config=opt_config,
-                )
-                opt_debug.append(metrics)
-                opt_abs = opt_rel[0].detach().cpu().numpy() + current_xy[None]
-                execute = min(int(args.execute_frames), len(opt_abs))
-                window_start = len(ego_history) - 1
-                for point in opt_abs[:execute]:
-                    exec_point = point.astype(np.float32)
-                    ego_history.append(exec_point.astype(np.float32))
-                    sim_t += 1
-                final_dist = float(np.linalg.norm(ego_history[-1] - goal_xy))
-                window_reached = final_dist <= float(args.arrival_radius_m)
-                window_end = len(ego_history) - 1
-                segments.append(
-                    {
-                        "type": "MOVE",
-                        "goal_type": goal.get("goal_type"),
-                        "start": int(window_start),
-                        "end": int(window_end),
-                        "reached_in_window": bool(window_reached),
-                        "final_distance_m": float(final_dist),
-                        "goal_xy": [float(goal_xy[0]), float(goal_xy[1])],
-                    }
+                    "MOVE",
+                    goal.get("goal_type"),
+                    segments,
+                    opt_debug,
                 )
                 if window_reached:
                     status = "move_reached"
@@ -645,39 +733,113 @@ def simulate_episode(
                 completed += 1
                 status = "completed"
         elif status not in {"timeout"}:
-            current = ego_history[-1]
             held = 0
             action_chunk_start = len(ego_history) - 1
+            action_failed = False
             while held < int(args.action_hold_frames):
+                current = ego_history[-1]
                 if action_intrusion_likely(goal_xy, others_clips, sim_t, int(args.horizon), float(args.interrupt_distance_m)):
+                    action_chunk_end = len(ego_history) - 1
+                    if action_chunk_end > action_chunk_start:
+                        segments.append(
+                            {
+                                "type": "ACTION",
+                                "goal_type": goal.get("goal_type"),
+                                "start": int(action_chunk_start),
+                                "end": int(action_chunk_end),
+                                "goal_xy": [float(goal_xy[0]), float(goal_xy[1])],
+                            }
+                        )
                     actions_interrupted += 1
                     wait_point = choose_wait_point(scene, current, goal_xy, others_clips, sim_t, args)
-                    wait_path = move_towards(current, wait_point, int(args.execute_frames), speed_bound, float(opt_config.dt))
-                    wait_start = len(ego_history) - 1
-                    for point in wait_path:
-                        ego_history.append(point.astype(np.float32))
-                        sim_t += 1
-                        waits += 1
-                    hold = min(int(args.wait_hold_frames), int(args.max_wait_frames))
-                    for _ in range(hold):
-                        ego_history.append(wait_point.astype(np.float32))
-                        sim_t += 1
-                        waits += 1
-                    return_path = move_towards(wait_point, current, int(args.execute_frames), speed_bound, float(opt_config.dt))
-                    for point in return_path:
-                        ego_history.append(point.astype(np.float32))
-                        sim_t += 1
-                        waits += 1
-                    current = ego_history[-1]
-                    segments.append(
-                        {
-                            "type": "WAIT",
-                            "goal_type": goal.get("goal_type"),
-                            "start": int(wait_start),
-                            "end": int(len(ego_history) - 1),
-                            "goal_xy": [float(goal_xy[0]), float(goal_xy[1])],
-                        }
-                    )
+                    move_wait_start = sim_t
+                    while (
+                        float(np.linalg.norm(ego_history[-1] - wait_point)) > float(args.arrival_radius_m)
+                        and sim_t - move_wait_start < int(args.max_frames_per_goal)
+                    ):
+                        phase_start_t = sim_t
+                        sim_t, _, reached_wait = run_optimized_move_window(
+                            scene,
+                            model,
+                            opt_config,
+                            device,
+                            args,
+                            ego_history,
+                            others_clips,
+                            sim_t,
+                            wait_point,
+                            "MOVE_TO_WAIT",
+                            goal.get("goal_type"),
+                            segments,
+                            opt_debug,
+                            action_goal_xy=goal_xy,
+                        )
+                        waits += int(sim_t - phase_start_t)
+                        if reached_wait:
+                            break
+                    if float(np.linalg.norm(ego_history[-1] - wait_point)) > float(args.arrival_radius_m):
+                        failed += 1
+                        timeouts += 1
+                        status = "wait_move_timeout"
+                        action_failed = True
+                        break
+
+                    waited = 0
+                    while action_intrusion_likely(goal_xy, others_clips, sim_t, int(args.horizon), float(args.wait_release_distance_m)):
+                        if waited >= int(args.max_wait_frames):
+                            break
+                        chunk = min(int(args.wait_hold_frames), int(args.max_wait_frames) - waited)
+                        sim_t, advanced = append_wait_hold_segment(
+                            ego_history,
+                            sim_t,
+                            chunk,
+                            wait_point,
+                            goal_xy,
+                            goal.get("goal_type"),
+                            segments,
+                        )
+                        waited += int(advanced)
+                        waits += int(advanced)
+                    if action_intrusion_likely(goal_xy, others_clips, sim_t, int(args.horizon), float(args.wait_release_distance_m)):
+                        failed += 1
+                        timeouts += 1
+                        status = "wait_timeout"
+                        action_failed = True
+                        break
+
+                    move_back_start = sim_t
+                    while (
+                        float(np.linalg.norm(ego_history[-1] - goal_xy)) > float(args.arrival_radius_m)
+                        and sim_t - move_back_start < int(args.max_frames_per_goal)
+                    ):
+                        phase_start_t = sim_t
+                        sim_t, _, reached_goal = run_optimized_move_window(
+                            scene,
+                            model,
+                            opt_config,
+                            device,
+                            args,
+                            ego_history,
+                            others_clips,
+                            sim_t,
+                            goal_xy,
+                            "MOVE_BACK_TO_GOAL",
+                            goal.get("goal_type"),
+                            segments,
+                            opt_debug,
+                            action_goal_xy=goal_xy,
+                        )
+                        waits += int(sim_t - phase_start_t)
+                        if reached_goal:
+                            break
+                    if float(np.linalg.norm(ego_history[-1] - goal_xy)) > float(args.arrival_radius_m):
+                        failed += 1
+                        timeouts += 1
+                        status = "wait_return_timeout"
+                        action_failed = True
+                        break
+                    action_chunk_start = len(ego_history) - 1
+                    continue
                 ego_history.append(current.astype(np.float32))
                 sim_t += 1
                 held += 1
@@ -692,8 +854,9 @@ def simulate_episode(
                         }
                     )
                     action_chunk_start = len(ego_history) - 1
-            completed += 1
-            status = "completed"
+            if not action_failed:
+                completed += 1
+                status = "completed"
         per_goal.append(
             {
                 "goal_type": goal.get("goal_type"),

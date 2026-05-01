@@ -88,7 +88,7 @@ class Stage1OptimizerV2Config:
     lr: float = 0.01
     grad_clip: float = 1.0
     w_prior: float = 2.0
-    w_goal: float = 1.0
+    w_goal: float = 3.0
     w_static: float = 10.0
     w_dyn: float = 10.0
     smooth_scale: float = 1.0

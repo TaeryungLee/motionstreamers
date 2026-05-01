@@ -79,6 +79,7 @@ def main() -> None:
         create_target_overlays,
         create_new_smplx_object,
         ensure_local_smplx_addon,
+        freeze_scene_animation,
         get_or_create_smplx_object,
     )
     from visualize_smplx_motion.load_smplx_animatioin_clear import load_smplx_animation_new
@@ -94,6 +95,7 @@ def main() -> None:
 
     scene_meshes = import_scene_mesh(Path(meta["scene_obj"]).resolve())
     apply_scene_material(scene_meshes)
+    freeze_scene_animation()
 
     max_frames = 0
     gender = str(meta.get("smplx_gender", "male"))

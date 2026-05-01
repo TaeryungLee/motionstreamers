@@ -246,6 +246,21 @@ def clear_existing_characters() -> None:
         bpy.data.objects.remove(obj, do_unlink=True)
 
 
+def freeze_scene_animation(frame: int = 0) -> None:
+    scene = bpy.context.scene
+    scene.frame_set(int(frame))
+    protected_prefixes = ("SMPLX-", "Codex")
+    for obj in bpy.data.objects:
+        if obj.name.startswith(protected_prefixes):
+            continue
+        obj.animation_data_clear()
+        if obj.data is not None:
+            obj.data.animation_data_clear()
+            shape_keys = getattr(obj.data, "shape_keys", None)
+            if shape_keys is not None:
+                shape_keys.animation_data_clear()
+
+
 def apply_camera_scale(scene: bpy.types.Scene, target_obj: bpy.types.Object, camera_scale: float) -> None:
     camera = scene.camera
     if camera is None:

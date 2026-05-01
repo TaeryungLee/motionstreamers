@@ -153,6 +153,7 @@ def main() -> None:
         crop_scene_meshes_for_debug,
         create_new_smplx_object,
         ensure_local_smplx_addon,
+        freeze_scene_animation,
         get_or_create_smplx_object,
         hide_oblique_occluders,
         hide_topdown_occluders,
@@ -172,6 +173,7 @@ def main() -> None:
     ensure_local_smplx_addon(project_root)
     if args.clear_existing_characters:
         clear_existing_characters()
+    freeze_scene_animation()
 
     created_objects: list[bpy.types.Object] = []
     max_frames = 0
