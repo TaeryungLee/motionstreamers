@@ -374,24 +374,29 @@ class Stage2Runtime:
         num_sampling_steps: int = 25,
         preprocessed_root: Path = DEFAULT_PREPROCESSED_ROOT,
         nb_voxels: int = 32,
+        stage2_dir_name: str = "stage2",
     ) -> None:
         self.dataset = str(dataset)
         self.device = device
         self.num_sampling_steps = int(num_sampling_steps)
         self.preprocessed_root = repo_path(preprocessed_root)
         self.dataset_root = self.preprocessed_root / self.dataset
+        self.stage2_dir_name = str(stage2_dir_name)
         self.nb_voxels = int(nb_voxels)
         self.coord_norm_meta = self._load_coord_norm_meta()
         self.motion_mean, self.motion_std = self._motion_mean_std()
         self.motion_mean_t = torch.from_numpy(self.motion_mean).float().to(device)
         self.motion_std_t = torch.from_numpy(self.motion_std).float().to(device)
-        self.move_wait = self._load_model(repo_path(move_wait_checkpoint), "move_wait")
-        self.action = self._load_model(repo_path(action_checkpoint), "action")
+        self.move_wait, self.move_wait_ckpt_args = self._load_model(repo_path(move_wait_checkpoint), "move_wait")
+        self.action, self.action_ckpt_args = self._load_model(repo_path(action_checkpoint), "action")
+        self.move_wait_history_frames, self.move_wait_target_frames = self._task_frame_config(self.move_wait_ckpt_args, "move_wait")
+        self.action_history_frames, _ = self._task_frame_config(self.action_ckpt_args, "action")
+        self.required_history_frames = max(self.move_wait_history_frames, self.action_history_frames, STAGE2_HISTORY_FRAMES)
         steps = int(max(self.move_wait.num_timesteps, self.action.num_timesteps))
         self.sqrt_alpha_bar, self.sqrt_one_minus_alpha_bar = diffusion_schedule(steps, device)
 
     def _load_coord_norm_meta(self) -> dict[str, float]:
-        path = self.dataset_root / "stage2" / "joint_coord_norm_meta.json"
+        path = self.dataset_root / self.stage2_dir_name / "joint_coord_norm_meta.json"
         if path.exists():
             data = load_json(path)
             return {key: float(data[key]) for key in ("x_scale", "z_scale", "y_center", "y_scale")}
@@ -404,7 +409,22 @@ class Stage2Runtime:
         std = np.maximum(np.tile(std_joint, 28).astype(np.float32), 1e-6)
         return mean, std
 
-    def _load_model(self, checkpoint: Path, task: str) -> Stage2Generator:
+    def _task_frame_config(self, ckpt_args: dict[str, Any], task: str) -> tuple[int, int]:
+        stage2_dir_name = str(ckpt_args.get("stage2_dir_name", self.stage2_dir_name))
+        manifest_path = self.dataset_root / stage2_dir_name / f"{task}_train.json"
+        if not manifest_path.exists():
+            manifest_path = self.dataset_root / stage2_dir_name / f"{task}_test.json"
+        history_frames = STAGE2_HISTORY_FRAMES
+        target_frames = MOVEWAIT_FRAMES if task == "move_wait" else 0
+        if manifest_path.exists():
+            payload = load_json(manifest_path)
+            config = payload.get("config") or {}
+            history_frames = int(config.get("history_frames", history_frames))
+            if task == "move_wait":
+                target_frames = int(config.get("move_future_frames", target_frames))
+        return max(1, int(history_frames)), max(1, int(target_frames))
+
+    def _load_model(self, checkpoint: Path, task: str) -> tuple[Stage2Generator, dict[str, Any]]:
         ckpt = torch.load(checkpoint, map_location="cpu")
         ckpt_args = dict(ckpt.get("args") or {})
         model = Stage2Generator(
@@ -422,7 +442,7 @@ class Stage2Runtime:
         )
         model.load_state_dict(ckpt["model"])
         model.to(self.device).eval()
-        return model
+        return model, ckpt_args
 
     def _scene_occ(self, scene_id: str, anchor_root: np.ndarray, world_to_local: np.ndarray, goal_world: np.ndarray) -> np.ndarray:
         scene_path = self.dataset_root / "scenes_v2" / scene_id / "scene.json"
@@ -455,27 +475,28 @@ class Stage2Runtime:
         body_goal_world: np.ndarray | None,
         hand_goal_world: np.ndarray | None,
         root_plan_world: np.ndarray | None,
+        history_frames: int,
         text: str = "",
         goal_type: str = "",
     ) -> dict[str, Any]:
         history = np.asarray(history_world, dtype=np.float32)
-        if history.shape[0] != STAGE2_HISTORY_FRAMES:
-            raise ValueError(f"history must have {STAGE2_HISTORY_FRAMES} frames, got {history.shape}")
+        if history.shape[0] != int(history_frames):
+            raise ValueError(f"history must have {history_frames} frames, got {history.shape}")
         target_frames = int(target_frames)
-        total_frames = STAGE2_HISTORY_FRAMES + target_frames
+        total_frames = int(history_frames) + target_frames
         anchor_frame = history[-1]
         anchor_root = anchor_frame[PELVIS_INDEX].astype(np.float32)
         yaw = yaw_from_pelvis_hips(anchor_frame)
         world_to_local = world_to_local_from_yaw(yaw)
         history_local = canonicalize_points(history.reshape(-1, 3), anchor_root, world_to_local).reshape(history.shape)
         motion_raw = np.zeros((total_frames, pose_dim(self.dataset)), dtype=np.float32)
-        motion_raw[:STAGE2_HISTORY_FRAMES] = history_local.reshape(STAGE2_HISTORY_FRAMES, -1)
+        motion_raw[: int(history_frames)] = history_local.reshape(int(history_frames), -1)
         target_mask = np.zeros((total_frames,), dtype=np.float32)
-        target_mask[STAGE2_HISTORY_FRAMES:] = 1.0
+        target_mask[int(history_frames) :] = 1.0
         history_mask = 1.0 - target_mask
         action_time = np.zeros((total_frames,), dtype=np.float32)
         if task == "action" and target_frames > 1:
-            action_time[STAGE2_HISTORY_FRAMES:] = np.linspace(0.0, 1.0, target_frames, dtype=np.float32)
+            action_time[int(history_frames) :] = np.linspace(0.0, 1.0, target_frames, dtype=np.float32)
 
         if body_goal_world is None:
             body_goal_world = history[-1, PELVIS_INDEX].astype(np.float32)
@@ -529,7 +550,7 @@ class Stage2Runtime:
             "anchor_yaw": torch.tensor([yaw], dtype=torch.float32, device=self.device),
             "world_to_local": torch.from_numpy(world_to_local[None]).float().to(self.device),
             "length": torch.tensor([total_frames], dtype=torch.long, device=self.device),
-            "history_frames": torch.tensor([STAGE2_HISTORY_FRAMES], dtype=torch.long, device=self.device),
+            "history_frames": torch.tensor([int(history_frames)], dtype=torch.long, device=self.device),
             "target_frames": torch.tensor([target_frames], dtype=torch.long, device=self.device),
             "task_id": torch.tensor([0 if task == "move_wait" else 1], dtype=torch.long, device=self.device),
             "text_id": torch.tensor([0], dtype=torch.long, device=self.device),
@@ -560,11 +581,12 @@ class Stage2Runtime:
         batch = self._batch(
             scene_id=scene_id,
             history_world=history_world,
-            target_frames=MOVEWAIT_FRAMES,
+            target_frames=self.move_wait_target_frames,
             task="move_wait",
             body_goal_world=body_goal_world,
             hand_goal_world=None,
             root_plan_world=root_plan_world,
+            history_frames=self.move_wait_history_frames,
             goal_type=goal_type,
         )
         pred = sample_stage2_motion(
@@ -575,7 +597,7 @@ class Stage2Runtime:
             num_steps=self.num_sampling_steps,
         )
         raw = (pred * self.motion_std_t.view(1, 1, -1) + self.motion_mean_t.view(1, 1, -1))[0].detach().cpu().numpy()
-        local = raw[STAGE2_HISTORY_FRAMES:].reshape(MOVEWAIT_FRAMES, 28, 3)
+        local = raw[self.move_wait_history_frames :].reshape(self.move_wait_target_frames, 28, 3)
         world = decanonicalize_points(local.reshape(-1, 3), batch["_anchor_root_np"], batch["_world_to_local_np"]).reshape(local.shape)
         return Stage2Generation(
             joints_world=world.astype(np.float32),
@@ -584,7 +606,7 @@ class Stage2Runtime:
             anchor_yaw=float(batch["_anchor_yaw_np"]),
             world_to_local=batch["_world_to_local_np"],
             task="move_wait",
-            target_frames=MOVEWAIT_FRAMES,
+            target_frames=self.move_wait_target_frames,
         )
 
     @torch.no_grad()
@@ -607,6 +629,7 @@ class Stage2Runtime:
             body_goal_world=body_goal_world,
             hand_goal_world=hand_goal_world,
             root_plan_world=None,
+            history_frames=self.action_history_frames,
             text=text,
             goal_type=goal_type,
         )
@@ -618,7 +641,7 @@ class Stage2Runtime:
             num_steps=self.num_sampling_steps,
         )
         raw = (pred * self.motion_std_t.view(1, 1, -1) + self.motion_mean_t.view(1, 1, -1))[0].detach().cpu().numpy()
-        local = raw[STAGE2_HISTORY_FRAMES:].reshape(target_frames, 28, 3)
+        local = raw[self.action_history_frames :].reshape(target_frames, 28, 3)
         world = decanonicalize_points(local.reshape(-1, 3), batch["_anchor_root_np"], batch["_world_to_local_np"]).reshape(local.shape)
         return Stage2Generation(
             joints_world=world.astype(np.float32),

@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-id", default=None)
     parser.add_argument("--scene-list-file", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_PREPROCESSED_ROOT)
+    parser.add_argument("--stage2-dir-name", default="stage2")
     parser.add_argument("--history-frames", type=int, default=5)
     parser.add_argument("--move-future-frames", type=int, default=21)
     parser.add_argument("--action-min-target-frames", type=int, default=30)
@@ -363,7 +364,7 @@ def manifest_payload(args: argparse.Namespace, split: str, kind: str, records: l
 
 def main() -> None:
     args = parse_args()
-    out_root = args.output_root / args.dataset / "stage2"
+    out_root = args.output_root / args.dataset / str(args.stage2_dir_name)
     for split in splits_to_build(args):
         built = build_for_split(args, split)
         stats = built["stats"]

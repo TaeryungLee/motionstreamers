@@ -184,6 +184,7 @@ class Stage2MotionDataset(Dataset):
         max_records: int = 0,
         mmap: bool = True,
         randomize_offsets: bool | None = None,
+        stage2_dir_name: str = "stage2",
     ) -> None:
         if task not in {"move_wait", "action"}:
             raise ValueError(f"task must be move_wait or action, got {task}")
@@ -196,7 +197,8 @@ class Stage2MotionDataset(Dataset):
         self.seed = int(seed)
         self.randomize_offsets = self.split == "train" if randomize_offsets is None else bool(randomize_offsets)
         self.array_cache = ArrayCache(mmap=mmap)
-        self.stage2_root = self.root / self.dataset / "stage2"
+        self.stage2_dir_name = str(stage2_dir_name)
+        self.stage2_root = self.root / self.dataset / self.stage2_dir_name
         self.dataset_root = self.root / self.dataset
 
         manifest_path = self.stage2_root / f"{self.task}_{self.split}.json"

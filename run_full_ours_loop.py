@@ -20,7 +20,6 @@ from models.full_ours_runtime import (
     EXECUTE_FRAMES,
     MOVEWAIT_FRAMES,
     OVERLAP_FRAMES,
-    STAGE2_HISTORY_FRAMES,
     Stage1Runtime,
     Stage2Runtime,
     WorldState,
@@ -79,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage1-optimizer-config", type=Path, required=True)
     parser.add_argument("--stage2-movewait-checkpoint", type=Path, required=True)
     parser.add_argument("--stage2-action-checkpoint", type=Path, required=True)
+    parser.add_argument("--stage2-dir-name", default="stage2")
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--output-root", type=Path, default=Path("outputs"))
     parser.add_argument("--device", default="cuda")
@@ -588,7 +588,7 @@ def execute_move_window(
     start_frame = len(state.ego_joints_world) - 1
     stage1_plan = stage1.plan(scene, state.ego_root_world, others_clips, state.sim_t, target_xy)
     plan21 = clamp_plan_after_arrival(
-        ensure_plan_len(stage1_plan.planned_root_world_30, MOVEWAIT_FRAMES),
+        ensure_plan_len(stage1_plan.planned_root_world_30, stage2.move_wait_target_frames),
         target_xy,
         float(args.arrival_radius_m),
     )
@@ -597,7 +597,7 @@ def execute_move_window(
         body_xyz = xyz_from_xz(target_xy, state.current_root_y)
     gen = stage2.generate_move_wait(
         scene_id=scene_id,
-        history_world=state.history_joints(),
+        history_world=state.history_joints(stage2.move_wait_history_frames),
         root_plan_world=root_plan_xyz(plan21, state.current_root_y),
         body_goal_world=body_xyz,
         goal_type=str(goal.get("goal_type", reason)),
@@ -651,10 +651,10 @@ def execute_wait_window(
     args: argparse.Namespace,
 ) -> int:
     start_frame = len(state.ego_joints_world) - 1
-    plan = np.repeat(state.current_root_xy[None], MOVEWAIT_FRAMES, axis=0)
+    plan = np.repeat(state.current_root_xy[None], stage2.move_wait_target_frames, axis=0)
     gen = stage2.generate_move_wait(
         scene_id=scene_id,
-        history_world=state.history_joints(),
+        history_world=state.history_joints(stage2.move_wait_history_frames),
         root_plan_world=root_plan_xyz(plan, state.current_root_y),
         body_goal_world=xyz_from_xz(wait_xy, state.current_root_y),
         goal_type="wait",
@@ -688,7 +688,7 @@ def generate_action_buffer(
     source = goal.get("source_segment") or {}
     gen = stage2.generate_action(
         scene_id=scene_id,
-        history_world=state.history_joints(),
+        history_world=state.history_joints(stage2.action_history_frames),
         duration=int(duration),
         body_goal_world=body_xyz,
         hand_goal_world=hand_xyz,
@@ -718,7 +718,7 @@ def simulate_full_episode(
     ego_clip = resolve_character_clip(args.dataset, scene_id, ego_char)
     others_clips = [resolve_character_clip(args.dataset, scene_id, ch) for ch in other_chars[:MAX_OTHERS]]
 
-    init_joints, init_sim_t = initial_gt_history(args.dataset, scene_id, ego_char, STAGE2_HISTORY_FRAMES)
+    init_joints, init_sim_t = initial_gt_history(args.dataset, scene_id, ego_char, stage2.required_history_frames)
     state = WorldState(
         sim_t=init_sim_t,
         ego_joints_world=[frame.astype(np.float32) for frame in init_joints],
@@ -1054,8 +1054,6 @@ def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    if int(args.execute_frames) != EXECUTE_FRAMES:
-        raise ValueError(f"full loop currently expects execute_frames={EXECUTE_FRAMES}")
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     episodes_dir = args.episodes_dir or (DEFAULT_ROOT / args.dataset / "episodes_v3")
     out_dir = output_root(args)
@@ -1078,7 +1076,12 @@ def main() -> None:
         device=device,
         num_sampling_steps=int(args.stage2_sampling_steps),
         nb_voxels=int(args.nb_voxels),
+        stage2_dir_name=str(args.stage2_dir_name),
     )
+    if int(args.execute_frames) > int(stage2.move_wait_target_frames):
+        raise ValueError(
+            f"execute_frames={args.execute_frames} exceeds MoveWait target_frames={stage2.move_wait_target_frames}"
+        )
 
     episode_paths = [repo_path(path) for path in sample_episode_set(args, repo_path(episodes_dir))]
     if args.max_episodes is not None:

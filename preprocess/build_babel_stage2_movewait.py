@@ -140,6 +140,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build BABEL Stage-2 MoveWait joints28 cache and manifests.")
     parser.add_argument("--raw-root", type=Path, default=DEFAULT_RAW_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--stage2-dir-name", default="stage2")
     parser.add_argument("--smplx-model-dir", type=Path, default=DEFAULT_SMPLX_MODEL_DIR)
     parser.add_argument("--split", choices=["train", "test", "all"], default="all")
     parser.add_argument("--history-frames", type=int, default=5)
@@ -429,15 +430,16 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     raw_root = repo_path(args.raw_root)
     out_root = repo_path(args.output_root) / "babel"
     joints_dir = out_root / "joints28"
-    stage2_dir = out_root / "stage2"
+    stage2_dir = out_root / str(args.stage2_dir_name)
     joints_dir.mkdir(parents=True, exist_ok=True)
     stage2_dir.mkdir(parents=True, exist_ok=True)
 
     joints_path = joints_dir / "joints28.npy"
     orient_path = joints_dir / "global_orient.npy"
     meta_path = joints_dir / "joints28_meta.json"
-    if (joints_path.exists() or orient_path.exists()) and not bool(args.overwrite):
-        raise FileExistsError(f"{repo_rel(joints_path)} exists; pass --overwrite to rebuild")
+    reuse_existing_joints = joints_path.exists() and orient_path.exists() and not bool(args.overwrite)
+    if (joints_path.exists() or orient_path.exists()) and not bool(args.overwrite) and not reuse_existing_joints:
+        raise FileExistsError(f"incomplete BABEL joints cache under {repo_rel(joints_dir)}; pass --overwrite to rebuild")
 
     splits = output_splits(str(args.split))
     loaded: list[tuple[str, str, list[dict[str, Any]], dict[str, Any]]] = []
@@ -456,12 +458,22 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         loaded.append((raw_split, out_split, motions, annotations))
         total_frames += sum(int(item["poses"].shape[0]) for item in motions)
 
-    joints_out = np.lib.format.open_memmap(joints_path, mode="w+", dtype=np.float32, shape=(total_frames, 28, 3))
-    orient_out = np.lib.format.open_memmap(orient_path, mode="w+", dtype=np.float32, shape=(total_frames, 3))
-
-    device = torch.device(str(args.device) if torch.cuda.is_available() and str(args.device).startswith("cuda") else "cpu")
-    model = make_smplx_model(args, device)
-    selected = torch.tensor(SMPLX_SELECTED_JOINTS_28, dtype=torch.long, device=device)
+    if reuse_existing_joints:
+        joints_out = np.load(joints_path, mmap_mode="r")
+        orient_out = np.load(orient_path, mmap_mode="r")
+        if tuple(joints_out.shape) != (total_frames, 28, 3):
+            raise ValueError(f"existing BABEL joints shape {joints_out.shape} does not match expected {(total_frames, 28, 3)}")
+        if tuple(orient_out.shape) != (total_frames, 3):
+            raise ValueError(f"existing BABEL orient shape {orient_out.shape} does not match expected {(total_frames, 3)}")
+        device = torch.device("cpu")
+        model = None
+        selected = None
+    else:
+        joints_out = np.lib.format.open_memmap(joints_path, mode="w+", dtype=np.float32, shape=(total_frames, 28, 3))
+        orient_out = np.lib.format.open_memmap(orient_path, mode="w+", dtype=np.float32, shape=(total_frames, 3))
+        device = torch.device(str(args.device) if torch.cuda.is_available() and str(args.device).startswith("cuda") else "cpu")
+        model = make_smplx_model(args, device)
+        selected = torch.tensor(SMPLX_SELECTED_JOINTS_28, dtype=torch.long, device=device)
 
     records_by_split: dict[str, list[dict[str, Any]]] = {out_split: [] for _, out_split in splits}
     label_counts: Counter[str] = Counter()
@@ -472,7 +484,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
     for raw_split, out_split, motions, annotations in loaded:
         sequence_counts[out_split] = len(motions)
-        progress = tqdm(motions, desc=f"babel {out_split} smplx forward", unit="seq")
+        desc = f"babel {out_split} reuse joints" if reuse_existing_joints else f"babel {out_split} smplx forward"
+        progress = tqdm(motions, desc=desc, unit="seq")
         for seq_idx, item in enumerate(progress):
             poses = np.asarray(item["poses"], dtype=np.float32)
             trans = np.asarray(item["trans"], dtype=np.float32)
@@ -480,10 +493,15 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             sequence_frames = int(poses.shape[0])
             seq_start = int(frame_cursor)
             seq_end = seq_start + sequence_frames
-            joints_seq = forward_joints28(model, poses, trans, selected, device, int(args.chunk_size))
-            orient_seq = convert_rotvec_babel_to_ours(poses[:, 0:3])
-            joints_out[seq_start:seq_end] = joints_seq
-            orient_out[seq_start:seq_end] = orient_seq
+            if reuse_existing_joints:
+                joints_seq = np.asarray(joints_out[seq_start:seq_end], dtype=np.float32)
+            else:
+                if model is None or selected is None:
+                    raise RuntimeError("BABEL SMPL-X model was not initialized")
+                joints_seq = forward_joints28(model, poses, trans, selected, device, int(args.chunk_size))
+                orient_seq = convert_rotvec_babel_to_ours(poses[:, 0:3])
+                joints_out[seq_start:seq_end] = joints_seq
+                orient_out[seq_start:seq_end] = orient_seq
 
             babel_id = str(item.get("babel_id"))
             ann = annotations.get(babel_id)
@@ -528,8 +546,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     debug_record = record
             frame_cursor = seq_end
 
-    joints_out.flush()
-    orient_out.flush()
+    if not reuse_existing_joints:
+        joints_out.flush()
+        orient_out.flush()
 
     coord_meta = {
         "dataset": "babel",
@@ -553,6 +572,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "reject_counts": dict(sorted(reject_counts.items())),
         "axis_conversion": "[x,y,z]_babel_amass -> [x,z,-y]_ours",
         "joint_source": "smplx_forward_from_babel_poses_trans",
+        "reused_existing_joints": bool(reuse_existing_joints),
     }
 
     for out_split, records in records_by_split.items():
@@ -573,6 +593,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "gender": str(args.gender),
             "axis_conversion_matrix": BABEL_TO_OURS.tolist(),
             "raw_root": repo_rel(raw_root),
+            "reused_existing_joints": bool(reuse_existing_joints),
         },
     )
 

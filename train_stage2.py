@@ -763,6 +763,7 @@ def build_loader(args: argparse.Namespace, split: str, shuffle: bool, max_record
                     nb_voxels=int(args.nb_voxels),
                     seed=int(args.seed),
                     randomize_offsets=bool(shuffle),
+                    stage2_dir_name=str(args.stage2_dir_name),
                 )
             )
     if not datasets:
@@ -799,6 +800,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", choices=["move_wait", "action"], required=True)
     parser.add_argument("--split", default="train")
     parser.add_argument("--eval-split", default="test")
+    parser.add_argument("--stage2-dir-name", default="stage2")
 
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--context-dim", type=int, default=256)
