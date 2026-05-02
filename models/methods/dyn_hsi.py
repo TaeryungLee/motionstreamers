@@ -47,9 +47,9 @@ class SinusoidalPosition(nn.Module):
 
 
 class DynamicSceneAwareNavigation(nn.Module):
-    """Dyn-HSI Vision module: autoregressive waypoint + confidence prediction."""
+    """Dyn-HSI vision module: 4-layer waypoint/confidence decoder."""
 
-    def __init__(self, dim: int = 512, text_dim: int = 768, nb_voxels: int = 32, depth: int = 4, heads: int = 8) -> None:
+    def __init__(self, dim: int = 32, text_dim: int = 768, nb_voxels: int = 32, depth: int = 4, heads: int = 4) -> None:
         super().__init__()
         self.dim = int(dim)
         self.position = MLP(3, dim, dim)
@@ -58,10 +58,22 @@ class DynamicSceneAwareNavigation(nn.Module):
         self.scene = ViT(
             image_size=nb_voxels,
             patch_size=8,
-            channels=nb_voxels * 2,
+            channels=nb_voxels,
             num_classes=dim,
             dim=dim,
-            depth=6,
+            depth=4,
+            heads=heads,
+            mlp_dim=dim * 2,
+            dropout=0.1,
+            emb_dropout=0.1,
+        )
+        self.scene_delta = ViT(
+            image_size=nb_voxels,
+            patch_size=8,
+            channels=nb_voxels,
+            num_classes=dim,
+            dim=dim,
+            depth=4,
             heads=heads,
             mlp_dim=dim * 2,
             dropout=0.1,
@@ -91,13 +103,16 @@ class DynamicSceneAwareNavigation(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B = current_pos.shape[0]
         scene_delta = (local_occ - prev_local_occ).to(dtype=local_occ.dtype)
-        scene_in = torch.cat([local_occ, scene_delta], dim=1)
-        memory = (
-            self.position(current_pos)
-            + self.goal(goal)
-            + self.text(text_emb.squeeze(1) if text_emb.ndim == 3 else text_emb)
-            + self.scene(scene_in)
-        ).unsqueeze(1)
+        memory = torch.stack(
+            [
+                self.position(current_pos),
+                self.goal(goal),
+                self.text(text_emb.squeeze(1) if text_emb.ndim == 3 else text_emb),
+                self.scene(local_occ),
+                self.scene_delta(scene_delta),
+            ],
+            dim=1,
+        )
         queries = self.query_pos(int(horizon), current_pos.device, current_pos.dtype).unsqueeze(0).repeat(B, 1, 1)
         hidden = self.decoder(tgt=queries, memory=memory)
         traj = self.traj_head(hidden)
@@ -113,9 +128,19 @@ class HierarchicalExperienceMemory:
     motion grouped by coarse verb, then ranked by multimodal similarity.
     """
 
-    def __init__(self, topk_per_key: int = 32, loss_threshold: float = 0.5) -> None:
+    def __init__(
+        self,
+        topk_per_key: int = 200,
+        loss_threshold: float = 0.001,
+        motion_weight: float = 0.1,
+        scene_weight: float = 0.4,
+        text_weight: float = 0.5,
+    ) -> None:
         self.topk_per_key = int(topk_per_key)
         self.loss_threshold = float(loss_threshold)
+        self.motion_weight = float(motion_weight)
+        self.scene_weight = float(scene_weight)
+        self.text_weight = float(text_weight)
         self.bank: dict[str, list[dict[str, torch.Tensor | float | str]]] = {}
 
     @staticmethod
@@ -157,11 +182,17 @@ class HierarchicalExperienceMemory:
         for item in bucket:
             s_scene = F.cosine_similarity(scene_cpu, item["scene"].flatten(), dim=0).item()
             s_text = F.cosine_similarity(text_cpu, item["text"].flatten(), dim=0).item()
-            score = 0.5 * s_scene + 0.5 * s_text - 0.01 * float(item["loss"])
+            score = self.scene_weight * s_scene + self.text_weight * s_text - 0.01 * float(item["loss"])
             if score > best_score:
                 best_score = score
                 best = item
         return None if best is None else best["motion"]
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"bank": self.bank}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.bank = dict(state.get("bank", {})) if isinstance(state, dict) else {}
 
 
 class DynHSIDiffusionController(nn.Module):
@@ -194,7 +225,7 @@ class DynHSIDiffusionController(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim,
             nhead=heads,
-            dim_feedforward=dim,
+            dim_feedforward=dim * 4,
             dropout=0.1,
             activation="gelu",
             batch_first=True,
@@ -221,19 +252,25 @@ class DynHSIDiffusionController(nn.Module):
         scene_token = self.scene(scene_occ)
         text_token = self.text(text_emb.squeeze(1) if text_emb.ndim == 3 else text_emb)
         goal_token = self.goal(goal)
-        traj_token = self.traj(torch.cat([traj, traj_conf[..., None]], dim=-1)).mean(dim=1)
+        traj_frame = self.traj(torch.cat([traj, traj_conf[..., None]], dim=-1))
+        traj_frame = traj_frame * traj_conf[..., None].clamp(0.0, 1.0)
+        traj_token = traj_frame.mean(dim=1)
         weights = self.adapter(text_token)
-        cond = (
-            scene_token * weights[:, 0:1]
-            + traj_token * weights[:, 1:2]
-            + text_token * weights[:, 2:3]
-            + goal_token * weights[:, 3:4]
-            + t_emb
-        ).unsqueeze(1)
+        cond = torch.stack(
+            [
+                scene_token * weights[:, 0:1],
+                traj_token * weights[:, 1:2],
+                text_token * weights[:, 2:3],
+                goal_token * weights[:, 3:4],
+            ],
+            dim=1,
+        )
+        cond = cond + t_emb[:, None, :]
         motion = self.input(x_t) * math.sqrt(self.dim)
         motion = motion + self.frame_pos(T, x_t.device, x_t.dtype).unsqueeze(0)
+        motion = motion + t_emb[:, None, :] + traj_frame * weights[:, None, 1:2]
         hidden = self.transformer(torch.cat([cond, motion], dim=1))
-        return self.output(hidden[:, 1:])
+        return self.output(hidden[:, cond.shape[1] :])
 
 
 class DynHSIModel(OriginalHSIBase):
@@ -244,12 +281,19 @@ class DynHSIModel(OriginalHSIBase):
         dim = int(kwargs.get("hidden_dim", 512))
         heads = int(kwargs.get("num_heads", 16))
         layers = int(kwargs.get("num_layers", 8))
-        self.window_frames = 16
+        self.window_frames = 48
         self.history_frames = 2
         self.motion_dim = int(motion_dim)
-        self.navigation = DynamicSceneAwareNavigation(dim=dim, text_dim=768, nb_voxels=32, depth=4, heads=max(1, heads // 2))
-        self.memory = HierarchicalExperienceMemory()
+        self.navigation = DynamicSceneAwareNavigation(dim=32, text_dim=768, nb_voxels=32, depth=4, heads=4)
+        self.memory = HierarchicalExperienceMemory(topk_per_key=200, loss_threshold=0.001)
         self.controller = DynHSIDiffusionController(motion_dim=motion_dim, dim=dim, text_dim=768, nb_voxels=32, heads=heads, layers=layers)
+
+    def get_extra_state(self) -> dict[str, Any]:
+        return {"memory": self.memory.state_dict()}
+
+    def set_extra_state(self, state: dict[str, Any]) -> None:
+        if isinstance(state, dict) and isinstance(state.get("memory"), dict):
+            self.memory.load_state_dict(state["memory"])
 
     @staticmethod
     def _denormalize_motion(x: torch.Tensor, batch: dict[str, Any]) -> torch.Tensor:

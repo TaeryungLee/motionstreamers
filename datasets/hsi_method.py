@@ -40,9 +40,9 @@ class HSIMethodSpec:
 
 
 HSI_METHOD_SPECS: dict[str, HSIMethodSpec] = {
-    "lingo": HSIMethodSpec(name="lingo", history_frames=2, window_frames=16),
-    "trumans": HSIMethodSpec(name="trumans", history_frames=2, window_frames=16),
-    "dyn_hsi": HSIMethodSpec(name="dyn_hsi", history_frames=2, window_frames=16),
+    "lingo": HSIMethodSpec(name="lingo", history_frames=2, window_frames=48),
+    "trumans": HSIMethodSpec(name="trumans", history_frames=2, window_frames=48),
+    "dyn_hsi": HSIMethodSpec(name="dyn_hsi", history_frames=2, window_frames=48),
 }
 
 

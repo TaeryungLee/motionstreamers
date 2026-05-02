@@ -260,7 +260,7 @@ class FaithfulLingoModel(OriginalHSIBase):
             scene_type="occ_two",
         )
         self.motion_dim = int(motion_dim)
-        self.window_frames = 16
+        self.window_frames = 48
         self.history_frames = 2
 
     def load_original_checkpoint(self, path: str | Path, map_location: str | torch.device = "cpu") -> None:
@@ -403,7 +403,7 @@ class FaithfulTrumansModel(OriginalHSIBase):
             no_action=False,
         )
         self.motion_dim = int(motion_dim)
-        self.window_frames = 16
+        self.window_frames = 48
         self.history_frames = 2
 
     def load_original_checkpoint(self, path: str | Path, map_location: str | torch.device = "cpu") -> None:
