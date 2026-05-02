@@ -350,3 +350,126 @@ populated scene에서 goal 달성률을 높인다
 
 
 Sampling관련해서는 StableMoFusion과 같은 방식대로 해. 걔네는 학습/sample때 몇 step 사용해?
+
+
+
+
+
+
+방향은 맞습니다. 다만 이건 **Stage2 MoveWait만 갈아끼우는 실험**으로 잡는 게 좋습니다. Stage1 prediction은 그대로 두고, Stage2 locomotion generator가 15-frame 짧은 window 때문에 깨지는 문제를 줄이는 쪽입니다.
+
+**핵심 결정**
+- Stage1 prediction: 유지
+  - predictor는 future 72를 뽑고 optimizer가 30-frame root plan을 만드니까 그대로 사용 가능.
+- Stage1 optimizer: 유지
+  - 방금 추가한 speed/acc bound + no-prior tuning 결과만 반영.
+- Stage2 MoveWait: 변경
+  - history 5 + future 30
+  - scene condition 제거
+  - TRUMANS/LINGO/BABEL locomotion+idle 데이터로 학습
+- Stage2 Action: 일단 유지
+  - action은 scene/goal/text가 중요하므로 이번 변경에서 제외.
+
+**1. Window 30 변경**
+MoveWait만:
+```text
+history = 5
+future = 30
+input window = clean history 5 + noisy future 30
+loss = future 30 only
+execute = 30 frames
+```
+
+수정 대상:
+- `datasets/stage2.py`
+  - MoveWait future length를 30으로.
+  - root plan length도 30으로.
+  - 기존 15+6 overlap 구조는 MoveWait v3에서는 끄거나 제거.
+- `train_stage2.py`
+  - MoveWait eval/vis가 30-frame future 기준으로 동작하게.
+- `models/stage2_generator.py`
+  - 모델 자체는 대부분 길이만 바뀌면 됨.
+  - positional/time embedding max length 확인.
+- `models/full_ours_runtime.py`
+  - MoveWait 호출 시 Stage1 optimizer output 30 frame 전체를 root plan으로 전달.
+  - execute도 30 frame 단위로 맞춤.
+  - Action은 기존 window 정책 유지 가능.
+
+**2. BABEL 추가**
+BABEL은 MoveWait 전용으로만 씁니다.
+
+목표:
+```text
+TRUMANS move/idle
++ LINGO move/idle
++ BABEL locomotion/idle
+→ Stage2 MoveWait 학습
+```
+
+BABEL preprocessing:
+- `data/raw/babel`에서 annotation/AMASS motion 읽기.
+- SMPL/SMPL-H 계열이면 SMPL-X param으로 억지 변환하지 말고, 우선 **joints28**만 생성.
+- scene 없음.
+- action text 없음.
+- body/hand goal 없음.
+- root plan은 GT pelvis future 30에서 생성.
+
+segment filtering:
+```text
+include:
+  walk, walking, locomotion, move, turn, stand, idle, stand still
+
+exclude:
+  sit, lie, jump, dance, exercise, gesture, interact, object action
+```
+
+라벨이 애매하면 motion 기반 필터도 같이 쓰는 게 좋습니다:
+```text
+move: root displacement / speed가 일정 이상
+idle: root speed가 낮고 standing posture
+```
+
+**3. MoveWait에서 Scene 제거**
+이건 꽤 중요합니다. 지금 locomotion 품질 문제는 scene generalization보다 root trajectory following 문제가 더 커 보여서, scene을 빼는 게 맞습니다.
+
+MoveWait condition:
+```text
+history joints: 5 frames
+root plan: 30 frames
+phase token: move / wait or idle
+```
+
+제거:
+```text
+scene current crop
+scene goal crop
+body goal scene
+goal scene ViT
+```
+
+ActionGen은 유지:
+```text
+history + scene + text + body/hand goal
+```
+
+즉 Stage2 모델/loader는 task별 condition branch가 달라져야 합니다.
+
+**4. 학습 실험 순서**
+지금 바로 하지 말고, 말한 대로 먼저:
+
+1. `loop_no_prior` tuning 완료
+2. no-prior optimizer config로 full loop 한 번 돌림
+3. 현재 Stage2 MoveWait checkpoint 기준 성능/문제 확인
+4. 그 다음 Stage2 MoveWait v3 실험 시작
+
+추천 run 이름:
+```text
+stage2_trumans_lingo_babel_movewait_joints28_030f_001
+```
+
+**주의할 리스크**
+- BABEL은 scene이 없으므로 MoveWait에서 scene을 빼야 섞기 쉽습니다.
+- BABEL joint convention이 현재 joints28과 정확히 맞는지 먼저 검증해야 합니다.
+- BABEL locomotion은 다양하지만 root trajectory condition과 motion이 잘 맞도록 canonicalization을 기존 Stage2와 완전히 동일하게 해야 합니다.
+- MoveWait window를 30으로 늘리면 Stage2는 안정될 가능성이 있지만, full loop 반응성은 15보다 둔해질 수 있습니다. 그래도 지금 문제는 foot sliding/window boundary가 더 크니 30 실험은 해볼 만합니다.
+

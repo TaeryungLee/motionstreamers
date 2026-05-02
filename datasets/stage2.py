@@ -15,8 +15,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PREPROCESSED_ROOT = Path("data") / "preprocessed"
 JOINTS28_COUNT = 28
 JOINTS28_DIM = JOINTS28_COUNT * 3
-ROOT_PLAN_FRAMES = 21
-ROLLOUT_STRIDE_FRAMES = 15
+ROOT_PLAN_FRAMES = 30
+ROLLOUT_STRIDE_FRAMES = 30
 
 
 def repo_path(path_str: str | None) -> Path | None:
@@ -46,7 +46,7 @@ class ArrayCache:
 
 
 def pose_dim(dataset: str) -> int:
-    if dataset not in {"trumans", "lingo"}:
+    if dataset not in {"trumans", "lingo", "babel"}:
         raise ValueError(f"unknown dataset: {dataset}")
     return JOINTS28_DIM
 
@@ -346,8 +346,10 @@ class Stage2MotionDataset(Dataset):
             if hand_goal_world is not None
             else np.zeros((3,), dtype=np.float32)
         )
-        scene_goal_world = endpoint_world if self.task == "move_wait" else body_goal_world
-        scene_occ = self._scene_tokens(record, anchor_root, world_to_local, scene_goal_world, endpoint_world)
+        if self.task == "move_wait":
+            scene_occ = np.zeros((self.nb_voxels * 2, self.nb_voxels, self.nb_voxels), dtype=np.float32)
+        else:
+            scene_occ = self._scene_tokens(record, anchor_root, world_to_local, body_goal_world, endpoint_world)
 
         norm_motion = (motion_raw - self.motion_mean[None]) / self.motion_std[None] if self.normalize else motion_raw
         root_plan = motion_raw[int(history_frames) :, :3].copy()
@@ -399,6 +401,7 @@ class Stage2MotionDataset(Dataset):
             "segment_id": int(record.get("segment_id", -1)),
             "goal_type": str(record.get("goal_type", "")),
             "text": str(record.get("text", "")),
+            "dataset_name": str(record.get("dataset", self.dataset)),
         }
 
         if self.task == "move_wait":
@@ -422,7 +425,7 @@ class Stage2MotionDataset(Dataset):
                     if hand_goal_world is not None
                     else np.zeros((3,), dtype=np.float32)
                 )
-                r_scene_occ = self._scene_tokens(record, r_anchor_root, r_world_to_local, r_endpoint_world, r_endpoint_world)
+                r_scene_occ = np.zeros_like(scene_occ, dtype=np.float32)
                 r_norm_motion = (r_motion_raw - self.motion_mean[None]) / self.motion_std[None] if self.normalize else r_motion_raw
                 r_root_plan = r_motion_raw[int(r_history_frames) :, :3].copy()
                 r_root_plan_mask = np.ones((r_root_plan.shape[0],), dtype=np.float32)
@@ -560,7 +563,7 @@ def stage2_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
             "rollout_target_start",
         ]:
             out[key] = torch.stack([item[key] for item in batch], dim=0)
-    for key in ["scene_id", "sequence_id", "segment_id", "goal_type", "text"]:
+    for key in ["dataset_name", "scene_id", "sequence_id", "segment_id", "goal_type", "text"]:
         out[key] = [item[key] for item in batch]
     return out
 

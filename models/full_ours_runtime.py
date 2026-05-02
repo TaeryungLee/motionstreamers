@@ -19,7 +19,12 @@ from datasets.stage2 import (
     normalize_xyz,
     pose_dim,
 )
-from models.stage1_planner import Stage1OptimizerV2Config, build_stage1_static_fields_v2, optimize_stage1_trajectory_batch_v2
+from models.stage1_planner import (
+    Stage1OptimizerV2Config,
+    build_stage1_static_fields_v2,
+    configure_stage1_motion_bounds,
+    optimize_stage1_trajectory_batch_v2,
+)
 from models.stage2_generator import Stage2Generator
 from train_stage2 import diffusion_schedule, sample_stage2_motion
 
@@ -279,8 +284,7 @@ class Stage1Runtime:
         allowed = Stage1OptimizerV2Config.__dataclass_fields__.keys()
         config = Stage1OptimizerV2Config(**{key: value for key, value in values.items() if key in allowed})
         config.horizon = int(horizon)
-        setattr(config, "speed_bound_mps", float(values.get("speed_bound_mps", 1.0)))
-        return config
+        return configure_stage1_motion_bounds(config, values, payload)
 
     def plan(
         self,
@@ -631,7 +635,7 @@ def fit_joints28_episode_to_smplx(
     joints_world: np.ndarray,
     out_path: Path,
     device: torch.device,
-    smooth_weight: float = 0.3,
+    smooth_weight: float = 0.0,
 ) -> None:
     from models.joints_to_smplx import JointsToSMPLX, joints_to_smpl
 

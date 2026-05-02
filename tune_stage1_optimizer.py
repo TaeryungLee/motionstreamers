@@ -90,10 +90,11 @@ def load_or_compute_speed_stats(
     if path.exists():
         existing = json.loads(path.read_text())
         requested = len(dataset) if int(max_samples) <= 0 else min(int(max_samples), len(dataset))
-        if int(existing.get("num_sampled_windows", 0)) >= int(requested):
+        required_keys = {"move_speed_mean", "move_acc_mean"}
+        if int(existing.get("num_sampled_windows", 0)) >= int(requested) and required_keys.issubset(existing.keys()):
             return existing
         log(
-            "existing velocity stats use fewer samples "
+            "existing velocity stats are incomplete or use fewer samples "
             f"({existing.get('num_sampled_windows')}) than requested ({requested}); recomputing"
         )
     sample_count = len(dataset) if int(max_samples) <= 0 else min(int(max_samples), len(dataset))
@@ -123,7 +124,10 @@ def load_or_compute_speed_stats(
         "move_speed_std": float(np.std(speed_values)),
         "move_speed_p95": float(np.percentile(speed_values, 95)),
         "move_speed_p99": float(np.percentile(speed_values, 99)),
+        "move_acc_mean": float(np.mean(acc_values)),
+        "move_acc_std": float(np.std(acc_values)),
         "move_acc_p95": float(np.percentile(acc_values, 95)),
+        "move_acc_p99": float(np.percentile(acc_values, 99)),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(stats, indent=2, sort_keys=True))
@@ -416,6 +420,18 @@ def grid_values(args: argparse.Namespace) -> dict[str, list[float]]:
             "static_topk_weight": [3.0],
             "static_topk_frac": [0.2],
         }
+    if args.grid == "loop_no_prior":
+        return {
+            "w_prior": [0.0],
+            "w_goal": [3.0, 10.0, 30.0],
+            "w_static": [3.0, 10.0, 30.0],
+            "w_dyn": [10.0],
+            "smooth_scale": [0.5],
+            "terminal_weight_ratio": [5.0],
+            "goal_progress_weight": [1.0],
+            "static_topk_weight": [3.0],
+            "static_topk_frac": [0.2],
+        }
     return {
         "w_prior": [1.0, 2.0, 4.0],
         "w_goal": [0.8, 1.0, 1.2],
@@ -546,7 +562,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--eval-sampling-steps", type=int, default=50)
-    parser.add_argument("--grid", choices=["coarse", "full", "loop_a"], default="coarse")
+    parser.add_argument("--grid", choices=["coarse", "full", "loop_a", "loop_no_prior"], default="coarse")
     parser.add_argument("--rebuild-prediction-cache", action="store_true")
     parser.add_argument("--velocity-stat-max-samples", type=int, default=50000)
     parser.add_argument("--max-configs", type=int, default=0)
@@ -566,8 +582,10 @@ def main() -> None:
     (args.output_dir / "selected_indices.json").write_text(json.dumps({"indices": indices}, indent=2))
     stats_dataset = build_dataset_for_split(args, args.velocity_stat_split)
     speed_stats = load_or_compute_speed_stats(args.dataset, stats_dataset, int(args.velocity_stat_max_samples), dt=1.0 / 30.0)
-    speed_bound = float(speed_stats["move_speed_p95"])
-    log(f"speed bound p95: {speed_bound:.4f} m/s")
+    speed_bound = float(speed_stats["move_speed_mean"])
+    acc_bound = float(speed_stats.get("move_acc_mean", speed_stats.get("move_acc_p95", 0.0)))
+    log(f"speed bound mean: {speed_bound:.4f} m/s")
+    log(f"acc bound mean: {acc_bound:.4f} m/s^2")
 
     cache_path = args.output_dir / "prediction_cache.pt"
     cache = build_prediction_cache(args, dataset, indices, device, cache_path)
@@ -588,6 +606,8 @@ def main() -> None:
     progress = tqdm(configs, desc="optimizer grid", unit="config")
     for config_idx, values in enumerate(progress):
         config = Stage1OptimizerV2Config(**values)
+        config.speed_bound_mps = speed_bound
+        config.acc_bound_mps2 = acc_bound
         metrics = run_one_config(cache, field_cache, config, speed_bound, args, device)
         row = {"config_idx": config_idx, **values, **metrics}
         rows.append(row)
@@ -620,7 +640,8 @@ def main() -> None:
                 "config": {
                     **asdict(config),
                     "speed_bound_mps": speed_bound,
-                    "w_init": float(config.smooth_scale),
+                    "acc_bound_mps2": acc_bound,
+                    "w_init": float(config.start_vel_weight),
                     "w_acc": float(config.smooth_scale),
                     "w_jerk": 0.3 * float(config.smooth_scale),
                 },

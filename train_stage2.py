@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 from tqdm import tqdm
 
 from datasets.stage2 import Stage2MotionDataset, masked_motion_mse, stage2_collate_fn
@@ -576,8 +576,10 @@ def render_eval_visualizations(
             if saved >= int(args.eval_vis_samples):
                 break
             length = int(lengths[local_idx].item())
+            sample_dataset = batch.get("dataset_name", [args.dataset] * pred_raw.shape[0])[local_idx]
             meta = {
-                "dataset": args.dataset,
+                "dataset": sample_dataset,
+                "training_dataset": args.dataset,
                 "task": args.task,
                 "step": int(step),
                 "batch_index": int(local_idx),
@@ -597,7 +599,7 @@ def render_eval_visualizations(
                 render_stage2_pair(
                     gt_raw[local_idx, :length],
                     pred_raw[local_idx, :length],
-                    dataset=args.dataset,
+                    dataset=sample_dataset,
                     out_dir=sample_dir,
                     smplx_model_dir=resolve_project_path(Path(args.smplx_model_dir)),
                     render_device=str(args.eval_vis_device),
@@ -692,16 +694,80 @@ def worker_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def build_loader(args: argparse.Namespace, split: str, shuffle: bool, max_records: int = 0) -> tuple[Stage2MotionDataset, DataLoader]:
-    dataset = Stage2MotionDataset(
-        dataset=args.dataset,
-        task=args.task,
-        split=split,
-        max_records=max_records,
-        nb_voxels=int(args.nb_voxels),
-        seed=int(args.seed),
-        randomize_offsets=bool(shuffle),
-    )
+class CombinedStage2MotionDataset(ConcatDataset):
+    def __init__(self, datasets: list[Stage2MotionDataset]) -> None:
+        if not datasets:
+            raise ValueError("CombinedStage2MotionDataset requires at least one dataset")
+        super().__init__(datasets)
+        first = datasets[0]
+        self.datasets_list = datasets
+        self.dataset_names = [dataset.dataset for dataset in datasets]
+        self.motion_mean = first.motion_mean
+        self.motion_std = first.motion_std
+        self.motion_dim = first.motion_dim
+        for dataset in datasets[1:]:
+            if int(dataset.motion_dim) != int(self.motion_dim):
+                raise ValueError(f"motion_dim mismatch in combined Stage2 dataset: {dataset.dataset}")
+            if not np.allclose(dataset.motion_mean, self.motion_mean) or not np.allclose(dataset.motion_std, self.motion_std):
+                raise ValueError(
+                    "combined Stage2 datasets must use the same motion normalization; "
+                    f"got mismatch at {dataset.dataset}"
+                )
+
+
+def parse_dataset_names(value: str) -> list[str]:
+    aliases = {
+        "all": ["trumans", "lingo", "babel"],
+        "motion_all": ["trumans", "lingo", "babel"],
+        "stage2_all": ["trumans", "lingo", "babel"],
+    }
+    key = str(value).strip().lower()
+    if key in aliases:
+        return aliases[key]
+    names = [part.strip().lower() for part in str(value).split(",") if part.strip()]
+    if not names:
+        raise ValueError("--dataset must not be empty")
+    valid = {"trumans", "lingo", "babel"}
+    unknown = [name for name in names if name not in valid]
+    if unknown:
+        raise ValueError(f"unknown Stage2 dataset(s): {unknown}")
+    return names
+
+
+def build_loader(args: argparse.Namespace, split: str, shuffle: bool, max_records: int = 0) -> tuple[Stage2MotionDataset | CombinedStage2MotionDataset, DataLoader]:
+    names = parse_dataset_names(str(args.dataset))
+    if len(names) > 1 and str(args.task) != "move_wait":
+        raise ValueError("multi-dataset Stage2 training is only supported for task=move_wait")
+    if str(args.task) != "move_wait" and "babel" in names:
+        raise ValueError("BABEL is only supported for Stage2 move_wait")
+
+    datasets: list[Stage2MotionDataset] = []
+    for name in names:
+        if name == "babel":
+            if split == "train":
+                babel_splits = ("train", "test")
+            elif len(names) == 1:
+                raise ValueError("BABEL is train-only auxiliary data and has no eval/test loader")
+            else:
+                continue
+        else:
+            babel_splits = (split,)
+
+        for dataset_split in babel_splits:
+            datasets.append(
+                Stage2MotionDataset(
+                    dataset=name,
+                    task=args.task,
+                    split=dataset_split,
+                    max_records=max_records,
+                    nb_voxels=int(args.nb_voxels),
+                    seed=int(args.seed),
+                    randomize_offsets=bool(shuffle),
+                )
+            )
+    if not datasets:
+        raise ValueError(f"no Stage2 datasets selected for split={split} dataset={args.dataset}")
+    dataset: Stage2MotionDataset | CombinedStage2MotionDataset = datasets[0] if len(datasets) == 1 else CombinedStage2MotionDataset(datasets)
     loader = DataLoader(
         dataset,
         batch_size=int(args.batch_size),
@@ -729,7 +795,7 @@ def dry_run(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage-2 full-body motion training entrypoint.")
     parser.add_argument("--run-name", required=True)
-    parser.add_argument("--dataset", choices=["trumans", "lingo"], required=True)
+    parser.add_argument("--dataset", required=True, help="Dataset name or comma-separated list. Use trumans,lingo,babel for joint MoveWait training.")
     parser.add_argument("--task", choices=["move_wait", "action"], required=True)
     parser.add_argument("--split", default="train")
     parser.add_argument("--eval-split", default="test")
@@ -786,7 +852,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-vis-image-size", type=int, default=384)
     parser.add_argument("--eval-vis-fps", type=int, default=30)
     parser.add_argument("--eval-vis-frame-stride", type=int, default=4)
-    parser.add_argument("--eval-vis-fit-smooth-weight", type=float, default=0.1)
+    parser.add_argument("--eval-vis-fit-smooth-weight", type=float, default=0.0)
     parser.add_argument("--eval-vis-device", default="cuda")
     parser.add_argument("--smplx-model-dir", type=Path, default=DEFAULT_SMPLX_MODEL_DIR)
     parser.add_argument("--no-eval-vis", action="store_true")

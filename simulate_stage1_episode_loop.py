@@ -27,6 +27,7 @@ from datasets.planning import (
 from models.stage1_planner import (
     Stage1OptimizerV2Config,
     build_stage1_static_fields_v2,
+    configure_stage1_motion_bounds,
     optimize_stage1_trajectory_batch_v2,
 )
 from models.stage1_predictor import Stage1Predictor
@@ -239,8 +240,7 @@ def load_optimizer_config(path: Path, args: argparse.Namespace) -> Stage1Optimiz
     if args.w_goal is not None:
         config.w_goal = float(args.w_goal)
     config.horizon = int(args.horizon)
-    setattr(config, "speed_bound_mps", float(values.get("speed_bound_mps", 1.0)))
-    return config
+    return configure_stage1_motion_bounds(config, values, payload)
 
 
 def pad_history(points: np.ndarray, end_exclusive: int, length: int) -> np.ndarray:

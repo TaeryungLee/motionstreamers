@@ -635,6 +635,10 @@ class Stage2BaseGenerator(nn.Module):
         context = torch.cat([history_tokens, scene_tokens], dim=1)
         return context, full_context_mask(context)
 
+    def history_context(self, batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        history_tokens = self.history(batch["motion"], batch["history_frames"])
+        return history_tokens, full_context_mask(history_tokens)
+
     def forward(self, batch: dict[str, torch.Tensor], diffusion_t: torch.Tensor) -> dict[str, torch.Tensor]:
         raise NotImplementedError
 
@@ -663,7 +667,7 @@ class MoveWaitGen(Stage2BaseGenerator):
         self.goals = GoalTokenEncoder(context_dim)
 
     def forward(self, batch: dict[str, torch.Tensor], diffusion_t: torch.Tensor) -> dict[str, torch.Tensor]:
-        base_context, base_mask = self.base_context(batch)
+        base_context, base_mask = self.history_context(batch)
         goal_tokens, goal_mask = self.goals(batch, include_hand=False)
         context = torch.cat([base_context, goal_tokens], dim=1)
         context_mask = torch.cat([base_mask, goal_mask.to(base_mask.device)], dim=1)

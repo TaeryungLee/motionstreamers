@@ -53,6 +53,7 @@ from simulate_stage1_episode_loop import (
 )
 from vis.episode_blender_common import (
     DEFAULT_BLENDER,
+    probe_video_size,
     render_side_by_side_mp4,
     resolve_lingo_scene_obj,
     resolve_trumans_scene_blend,
@@ -103,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-plots", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-window-plots-per-episode", type=int, default=24)
     parser.add_argument("--save-root-videos", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--root-video-fps", type=int, default=15)
+    parser.add_argument("--root-video-fps", type=int, default=30)
     parser.add_argument("--root-video-history-frames", type=int, default=30)
     parser.add_argument("--render-blender", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--max-blender-videos", type=int, default=5, help="Maximum Blender videos per run. Use 0 for no limit.")
@@ -114,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blender-frame-limit", type=int, default=None)
     parser.add_argument("--show-targets", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--fit-smplx", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--fit-smooth-weight", type=float, default=0.3)
+    parser.add_argument("--fit-smooth-weight", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -417,6 +418,39 @@ def render_full_loop_blender_video(
         render_side_by_side_mp4(render_paths, output_mp4, text_overlays=None, dry_run=False)
 
 
+def render_full_loop_final_video(blender_video_path: Path, root_video_path: Path, output_path: Path) -> None:
+    _, target_height = probe_video_size(blender_video_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    filter_complex = (
+        f"[0:v]setsar=1[blender];"
+        f"[1:v]scale=-2:{int(target_height)},setsar=1[root];"
+        f"[blender][root]hstack=inputs=2[out]"
+    )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(blender_video_path),
+        "-i",
+        str(root_video_path),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[out]",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        str(output_path),
+    ]
+    subprocess.run(cmd, check=True)
+
+
 def active_segment_at_frame(segments: list[dict[str, Any]], frame_idx: int) -> dict[str, Any] | None:
     for segment in segments:
         if int(segment.get("start", 0)) <= int(frame_idx) <= int(segment.get("end", 0)):
@@ -477,6 +511,10 @@ def render_root_video_frame(
         goal_type = ""
 
     ax.set_aspect("equal", adjustable="box")
+    x0, x1 = extent[0], extent[1]
+    z0, z1 = extent[2], extent[3]
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(z1, z0)
     ax.set_title(f"{title}\nframe {frame_idx:04d} | {phase} {goal_type} | previous {history_frames} frames")
     ax.set_xlabel("x")
     ax.set_ylabel("z")
@@ -941,8 +979,8 @@ def simulate_full_episode(
             )
         result["plot_dir"] = display_path(plots_root)
 
+    root_video_path = out_dir / "root_videos" / scene_id / f"{episode_path.stem}.mp4"
     if bool(args.save_root_videos):
-        root_video_path = out_dir / "root_videos" / scene_id / f"{episode_path.stem}.mp4"
         save_root_debug_video(
             root_video_path,
             scene,
@@ -985,6 +1023,10 @@ def simulate_full_episode(
         render_full_loop_blender_video(args, scene_id, meta_path, video_path)
         result["blender_meta_path"] = display_path(meta_path)
         result["blender_video_path"] = display_path(video_path)
+        if bool(args.save_root_videos) and root_video_path.exists():
+            final_video_path = out_dir / "final_videos" / scene_id / f"{episode_path.stem}.mp4"
+            render_full_loop_final_video(video_path, root_video_path, final_video_path)
+            result["final_video_path"] = display_path(final_video_path)
 
     result_path = out_dir / "results" / scene_id / f"{episode_path.stem}.json"
     write_json(result_path, result)

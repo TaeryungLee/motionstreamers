@@ -27,7 +27,7 @@ class JointsToSMPLX(nn.Module):
         return self.layers(x)
 
 
-def optimize_smpl(pose_pred, joints, joints_ind, hand_pca=45, smooth_weight=0.1):
+def optimize_smpl(pose_pred, joints, joints_ind, hand_pca=45, smooth_weight=0.0):
     device = joints.device
     len = joints.shape[0]
 
@@ -86,7 +86,7 @@ def optimize_smpl(pose_pred, joints, joints_ind, hand_pca=45, smooth_weight=0.1)
     return pose_input.detach().cpu().numpy(), transl.detach().cpu().numpy(), left_hand.detach().cpu().numpy(), right_hand.detach().cpu().numpy(), vertices_output
 
 
-def joints_to_smpl(model, joints, joints_ind, interp_s, smooth_weight=0.1):
+def joints_to_smpl(model, joints, joints_ind, interp_s, smooth_weight=0.0):
     joints = interpolate_joints(joints, scale=interp_s)
     # joints = interpolate_joints(joints, scale=0.33)
     # joints = interpolate_joints(joints, scale=interp_s * 3)

@@ -5,7 +5,7 @@ import heapq
 import json
 import math
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Mapping, Optional
 
 import numpy as np
 import torch
@@ -109,6 +109,9 @@ class Stage1OptimizerV2Config:
     init_mode: str = "blend"
     goal_threshold: float = 0.2
     goal_unsafe_ratio_threshold: float = 0.25
+    speed_bound_mps: float = 1.0
+    acc_bound_mps2: float = 0.0
+    start_vel_weight: float = 3.0
 
 
 SPEED_PROFILE: dict[Mode, dict[str, float]] = {
@@ -129,6 +132,47 @@ def load_speed_profile(path: str | Path) -> dict[Mode, dict[str, float]]:
             "v_max": float(values.get("v_max", SPEED_PROFILE[mode]["v_max"])),
         }
     return out
+
+
+def _first_float(*values: Any) -> Optional[float]:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def configure_stage1_motion_bounds(
+    config: Stage1OptimizerV2Config,
+    values: Mapping[str, Any],
+    payload: Optional[Mapping[str, Any]] = None,
+) -> Stage1OptimizerV2Config:
+    stats = {}
+    if payload is not None and isinstance(payload.get("speed_stats"), Mapping):
+        stats = dict(payload["speed_stats"])
+
+    speed_bound = _first_float(
+        values.get("speed_mean_mps"),
+        values.get("move_speed_mean"),
+        stats.get("move_speed_mean"),
+        values.get("speed_bound_mps"),
+        stats.get("move_speed_p95"),
+        config.speed_bound_mps,
+    )
+    acc_bound = _first_float(
+        values.get("acc_bound_mps2"),
+        values.get("acc_mean_mps2"),
+        values.get("move_acc_mean"),
+        stats.get("move_acc_mean"),
+        stats.get("move_acc_p95"),
+        config.acc_bound_mps2,
+    )
+    config.speed_bound_mps = float(speed_bound if speed_bound is not None else config.speed_bound_mps)
+    config.acc_bound_mps2 = float(acc_bound if acc_bound is not None else config.acc_bound_mps2)
+    return config
 
 
 def as_numpy(x: Any, dtype: np.dtype = np.float32) -> np.ndarray:
@@ -495,9 +539,49 @@ def build_stage1_static_fields_v2(
 
 
 def limit_velocity_norm(vel: torch.Tensor, max_speed: float) -> torch.Tensor:
+    if float(max_speed) <= 0.0:
+        return vel
     speed = vel.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = torch.clamp(float(max_speed) / speed, max=1.0)
     return vel * scale
+
+
+def limit_acceleration_norm(
+    vel: torch.Tensor,
+    current_vel_xy: torch.Tensor,
+    max_acc: float,
+    dt: float,
+    max_speed: Optional[float] = None,
+) -> torch.Tensor:
+    if float(max_acc) <= 0.0 or vel.shape[1] == 0:
+        return vel
+
+    max_delta = float(max_acc) * float(dt)
+    prev = current_vel_xy
+    if max_speed is not None and float(max_speed) > 0.0:
+        prev = limit_velocity_norm(prev[:, None], float(max_speed))[:, 0]
+
+    out = []
+    for t in range(vel.shape[1]):
+        delta = vel[:, t] - prev
+        delta_norm = delta.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        scale = torch.clamp(max_delta / delta_norm, max=1.0)
+        clipped = prev + delta * scale
+        out.append(clipped)
+        prev = clipped
+    return torch.stack(out, dim=1)
+
+
+def constrain_stage1_velocity(
+    vel: torch.Tensor,
+    current_vel_xy: torch.Tensor,
+    speed_bound: float,
+    acc_bound: float,
+    dt: float,
+) -> torch.Tensor:
+    vel = limit_velocity_norm(vel, speed_bound)
+    vel = limit_acceleration_norm(vel, current_vel_xy, acc_bound, dt, max_speed=speed_bound)
+    return vel
 
 
 def integrate_positions_batch(current_pos_xy: torch.Tensor, vel_xy: torch.Tensor, dt: float) -> torch.Tensor:
@@ -527,6 +611,9 @@ def optimize_stage1_trajectory_batch_v2(
     pred_others = pred_others[:, :, :horizon]
     gt_others = gt_others[:, :, :horizon]
     current_pos = torch.zeros((B, 2), device=device, dtype=pred_ego.dtype)
+    speed_bound = float(speed_bound if float(speed_bound) > 0.0 else config.speed_bound_mps)
+    acc_bound = float(config.acc_bound_mps2)
+    current_vel_ref = limit_velocity_norm(current_vel_xy[:, None], speed_bound)[:, 0]
     pred_vel = torch.empty_like(pred_ego)
     pred_vel[:, 0] = (pred_ego[:, 0] - current_pos) / float(config.dt)
     if horizon > 1:
@@ -540,9 +627,10 @@ def optimize_stage1_trajectory_batch_v2(
         init_vel = 0.5 * (pred_vel + current_vel_seq)
     else:
         raise ValueError(f"unsupported init_mode: {config.init_mode}")
-    vel_param = torch.nn.Parameter(limit_velocity_norm(init_vel, speed_bound).detach().clone())
+    init_vel = constrain_stage1_velocity(init_vel, current_vel_xy, speed_bound, acc_bound, float(config.dt))
+    vel_param = torch.nn.Parameter(init_vel.detach().clone())
     optimizer = torch.optim.Adam([vel_param], lr=float(config.lr))
-    w_init = float(config.smooth_scale)
+    w_init = float(config.start_vel_weight)
     w_acc = float(config.smooth_scale)
     w_jerk = 0.3 * float(config.smooth_scale)
     others_valid_f = others_valid[:, :, None].to(dtype=pred_ego.dtype, device=device)
@@ -550,7 +638,7 @@ def optimize_stage1_trajectory_batch_v2(
 
     debug: dict[str, float] = {}
     for _ in range(int(config.iters)):
-        vel = limit_velocity_norm(vel_param, speed_bound)
+        vel = constrain_stage1_velocity(vel_param, current_vel_xy, speed_bound, acc_bound, float(config.dt))
         pos = integrate_positions_batch(current_pos, vel, float(config.dt))
         prior_cost = (pos - pred_ego).square().sum(dim=-1).mean()
         goal_values = sample_batched_static_maps(goal_distance_fields, pos, origin_xy, resolution)
@@ -578,7 +666,7 @@ def optimize_stage1_trajectory_batch_v2(
             dyn_cost = (dyn_values * others_valid_f).sum() / others_valid_f.sum().clamp_min(1.0) / float(horizon)
         else:
             dyn_cost = pred_ego.new_zeros(())
-        init_cost = (vel[:, 0] - current_vel_xy).square().sum(dim=-1).mean()
+        init_cost = (vel[:, 0] - current_vel_ref).square().sum(dim=-1).mean()
         acc_cost = (vel[:, 1:] - vel[:, :-1]).square().sum(dim=-1).mean() if horizon > 1 else pred_ego.new_zeros(())
         jerk_cost = (
             (vel[:, 2:] - 2.0 * vel[:, 1:-1] + vel[:, :-2]).square().sum(dim=-1).mean()
@@ -613,7 +701,7 @@ def optimize_stage1_trajectory_batch_v2(
         }
 
     with torch.no_grad():
-        vel = limit_velocity_norm(vel_param, speed_bound)
+        vel = constrain_stage1_velocity(vel_param, current_vel_xy, speed_bound, acc_bound, float(config.dt))
         pos = integrate_positions_batch(current_pos, vel, float(config.dt))
         gt_dist = (pos - gt_ego).norm(dim=-1)
         goal_values = sample_batched_static_maps(goal_distance_fields, pos, origin_xy, resolution)
@@ -647,7 +735,19 @@ def optimize_stage1_trajectory_batch_v2(
             "min_dynamic_distance_m": float(min_dynamic_distance_m.detach().cpu()),
             "mean_speed_mps": float(vel.norm(dim=-1).mean().detach().cpu()),
             "max_speed_mps": float(vel.norm(dim=-1).max().detach().cpu()),
+            "speed_bound_mps": float(speed_bound),
+            "acc_bound_mps2": float(acc_bound),
         }
+        if horizon > 0:
+            delta_vel = torch.cat([vel[:, :1] - current_vel_ref[:, None], vel[:, 1:] - vel[:, :-1]], dim=1)
+            acc_norm = delta_vel.norm(dim=-1) / float(config.dt)
+            metrics.update(
+                {
+                    "mean_acc_mps2": float(acc_norm.mean().detach().cpu()),
+                    "max_acc_mps2": float(acc_norm.max().detach().cpu()),
+                    "start_vel_error_mps": float((vel[:, 0] - current_vel_ref).norm(dim=-1).mean().detach().cpu()),
+                }
+            )
         metrics.update({f"debug_{key}": value for key, value in debug.items()})
     return pos.detach(), metrics
 

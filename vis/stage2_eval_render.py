@@ -150,7 +150,7 @@ def motion_to_vertices(
     device: torch.device,
     anchor_root: torch.Tensor | None = None,
     world_to_local: torch.Tensor | None = None,
-    fit_smooth_weight: float = 0.1,
+    fit_smooth_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import smplx
 
@@ -209,7 +209,7 @@ def joints28_motion_to_vertices(
     device: torch.device,
     anchor_root: torch.Tensor | None = None,
     world_to_local: torch.Tensor | None = None,
-    fit_smooth_weight: float = 0.1,
+    fit_smooth_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import smplx
     from models.joints_to_smplx import JointsToSMPLX, joints_to_smpl
@@ -356,7 +356,7 @@ def render_stage2_pair(
     meta: dict[str, Any] | None = None,
     anchor_root: torch.Tensor | None = None,
     world_to_local: torch.Tensor | None = None,
-    fit_smooth_weight: float = 0.1,
+    fit_smooth_weight: float = 0.0,
 ) -> None:
     device = torch.device(render_device if torch.cuda.is_available() and str(render_device).startswith("cuda") else "cpu")
     stride = max(1, int(frame_stride))
@@ -402,7 +402,7 @@ def render_stage2_gt(
     meta: dict[str, Any] | None = None,
     anchor_root: torch.Tensor | None = None,
     world_to_local: torch.Tensor | None = None,
-    fit_smooth_weight: float = 0.1,
+    fit_smooth_weight: float = 0.0,
 ) -> None:
     device = torch.device(render_device if torch.cuda.is_available() and str(render_device).startswith("cuda") else "cpu")
     stride = max(1, int(frame_stride))
@@ -426,7 +426,7 @@ def render_stage2_gt(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render Stage2 GT motion samples with PyTorch3D.")
-    parser.add_argument("--dataset", choices=["trumans", "lingo"], required=True)
+    parser.add_argument("--dataset", choices=["trumans", "lingo", "babel"], required=True)
     parser.add_argument("--task", choices=["move_wait", "action"], required=True)
     parser.add_argument("--split", default="test")
     parser.add_argument("--num-samples", type=int, default=10)
