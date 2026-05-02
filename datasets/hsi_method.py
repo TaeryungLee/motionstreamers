@@ -335,6 +335,7 @@ class HSIUnifiedDataset(Dataset):
             "valid_mask": torch.from_numpy(valid_mask),
             "scene_occ": torch.from_numpy(scene_occ.astype(np.float32)),
             "body_goal": torch.from_numpy(body_goal_local.astype(np.float32)),
+            "body_goal_world": torch.from_numpy(body_goal_world.astype(np.float32)),
             "hand_goal": torch.from_numpy(hand_goal_local.astype(np.float32)),
             "body_goal_cond": torch.from_numpy(normalize_xyz(body_goal_local[None], self.coord_norm_meta)[0].astype(np.float32)),
             "hand_goal_cond": torch.from_numpy(normalize_xyz(hand_goal_local[None], self.coord_norm_meta)[0].astype(np.float32)),

@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import heapq
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from vit_pytorch import ViT
 from .original_hsi import OriginalHSIBase
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def repo_path(path: str | Path) -> Path:
+    value = Path(path)
+    return value if value.is_absolute() else PROJECT_ROOT / value
 
 
 @dataclass
@@ -44,6 +55,159 @@ class SinusoidalPosition(nn.Module):
 
     def forward(self, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         return self.pe[:length].to(device=device, dtype=dtype)
+
+
+def _world_from_local(local: torch.Tensor, anchor_root: torch.Tensor, world_to_local: torch.Tensor) -> torch.Tensor:
+    offset = torch.stack([anchor_root[:, 0], torch.zeros_like(anchor_root[:, 1]), anchor_root[:, 2]], dim=-1)
+    return torch.bmm(local[:, None], world_to_local).squeeze(1) + offset
+
+
+def _local_from_world(world: np.ndarray, anchor_root: np.ndarray, world_to_local: np.ndarray) -> np.ndarray:
+    offset = np.asarray([anchor_root[0], 0.0, anchor_root[2]], dtype=np.float32)
+    return ((np.asarray(world, dtype=np.float32) - offset) @ np.asarray(world_to_local, dtype=np.float32).T).astype(np.float32)
+
+
+def _grid_index(xz: np.ndarray, meta: dict[str, Any]) -> tuple[int, int]:
+    x_min = float(meta["x_min"])
+    x_max = float(meta["x_max"])
+    z_min = float(meta["z_min"])
+    z_max = float(meta["z_max"])
+    x_res = int(meta["x_res"])
+    z_res = int(meta["z_res"])
+    ix = int(np.floor((float(xz[0]) - x_min) / max(x_max - x_min, 1e-6) * x_res))
+    iz = int(np.floor((float(xz[1]) - z_min) / max(z_max - z_min, 1e-6) * z_res))
+    return int(np.clip(ix, 0, x_res - 1)), int(np.clip(iz, 0, z_res - 1))
+
+
+def _world_xz(index: tuple[int, int], meta: dict[str, Any]) -> np.ndarray:
+    ix, iz = index
+    x_min = float(meta["x_min"])
+    x_max = float(meta["x_max"])
+    z_min = float(meta["z_min"])
+    z_max = float(meta["z_max"])
+    x_res = int(meta["x_res"])
+    z_res = int(meta["z_res"])
+    x = x_min + (float(ix) + 0.5) / max(float(x_res), 1.0) * (x_max - x_min)
+    z = z_min + (float(iz) + 0.5) / max(float(z_res), 1.0) * (z_max - z_min)
+    return np.asarray([x, z], dtype=np.float32)
+
+
+def _nearest_free(obstacle: np.ndarray, node: tuple[int, int], max_radius: int = 64) -> tuple[int, int] | None:
+    h, w = obstacle.shape
+    sx, sz = int(np.clip(node[0], 0, h - 1)), int(np.clip(node[1], 0, w - 1))
+    if not bool(obstacle[sx, sz]):
+        return sx, sz
+    best: tuple[int, int] | None = None
+    best_dist = float("inf")
+    for radius in range(1, int(max_radius) + 1):
+        x0, x1 = max(0, sx - radius), min(h - 1, sx + radius)
+        z0, z1 = max(0, sz - radius), min(w - 1, sz + radius)
+        candidates: list[tuple[int, int]] = []
+        for x in range(x0, x1 + 1):
+            candidates.append((x, z0))
+            candidates.append((x, z1))
+        for z in range(z0 + 1, z1):
+            candidates.append((x0, z))
+            candidates.append((x1, z))
+        for x, z in candidates:
+            if bool(obstacle[x, z]):
+                continue
+            dist = float((x - sx) ** 2 + (z - sz) ** 2)
+            if dist < best_dist:
+                best_dist = dist
+                best = (x, z)
+        if best is not None:
+            return best
+    return None
+
+
+def _astar(obstacle: np.ndarray, start: tuple[int, int], goal: tuple[int, int], max_runs: int = 250000) -> list[tuple[int, int]] | None:
+    h, w = obstacle.shape
+    start_free = _nearest_free(obstacle, start, max_radius=max(h, w))
+    goal_free = _nearest_free(obstacle, goal, max_radius=max(h, w))
+    if start_free is None or goal_free is None:
+        return None
+    start = start_free
+    goal = goal_free
+    if start == goal:
+        return [start]
+
+    def heuristic(a: tuple[int, int], b: tuple[int, int]) -> float:
+        return float(math.hypot(a[0] - b[0], a[1] - b[1]))
+
+    g_score = np.full((h, w), np.inf, dtype=np.float32)
+    came_x = np.full((h, w), -1, dtype=np.int32)
+    came_z = np.full((h, w), -1, dtype=np.int32)
+    closed = np.zeros((h, w), dtype=np.bool_)
+    g_score[start] = 0.0
+    heap: list[tuple[float, float, int, int]] = [(heuristic(start, goal), 0.0, start[0], start[1])]
+    neighbors = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0), (-1, -1, math.sqrt(2.0)), (-1, 1, math.sqrt(2.0)), (1, -1, math.sqrt(2.0)), (1, 1, math.sqrt(2.0))]
+    runs = 0
+    while heap and runs < int(max_runs):
+        _, current_g, x, z = heapq.heappop(heap)
+        if closed[x, z]:
+            continue
+        closed[x, z] = True
+        if (x, z) == goal:
+            path = [(x, z)]
+            while (x, z) != start:
+                px, pz = int(came_x[x, z]), int(came_z[x, z])
+                if px < 0 or pz < 0:
+                    return None
+                x, z = px, pz
+                path.append((x, z))
+            path.reverse()
+            return path
+        runs += 1
+        for dx, dz, cost in neighbors:
+            nx, nz = x + dx, z + dz
+            if nx < 0 or nx >= h or nz < 0 or nz >= w or bool(obstacle[nx, nz]) or closed[nx, nz]:
+                continue
+            candidate_g = current_g + float(cost)
+            if candidate_g >= float(g_score[nx, nz]):
+                continue
+            g_score[nx, nz] = candidate_g
+            came_x[nx, nz] = x
+            came_z[nx, nz] = z
+            heapq.heappush(heap, (candidate_g + heuristic((nx, nz), goal), candidate_g, nx, nz))
+    return None
+
+
+def _resample_path(points: np.ndarray, horizon: int) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float32)
+    if len(points) == 0:
+        raise ValueError("empty path")
+    if len(points) == 1:
+        return np.repeat(points[:1], int(horizon), axis=0)
+    seg = np.linalg.norm(points[1:] - points[:-1], axis=-1)
+    dist = np.concatenate([[0.0], np.cumsum(seg)])
+    if float(dist[-1]) <= 1e-6:
+        return np.repeat(points[:1], int(horizon), axis=0)
+    query = np.linspace(0.0, float(dist[-1]), int(horizon) + 1, dtype=np.float32)[1:]
+    x = np.interp(query, dist, points[:, 0])
+    z = np.interp(query, dist, points[:, 1])
+    return np.stack([x, z], axis=-1).astype(np.float32)
+
+
+def _build_obstacle_xz(occ: np.ndarray, meta: dict[str, Any], margin_m: float = 0.25) -> np.ndarray:
+    arr = np.asarray(occ)
+    if arr.ndim != 3:
+        raise ValueError(f"scene occupancy must be 3D, got {arr.shape}")
+    y_min = float(meta["y_min"])
+    y_max = float(meta["y_max"])
+    y_res = int(meta["y_res"])
+    y0 = int(np.floor((0.1 - y_min) / max(y_max - y_min, 1e-6) * y_res))
+    y1 = int(np.ceil((1.2 - y_min) / max(y_max - y_min, 1e-6) * y_res))
+    y0 = int(np.clip(y0, 0, y_res - 1))
+    y1 = int(np.clip(max(y1, y0 + 1), y0 + 1, y_res))
+    obstacle = np.any(arr[:, y0:y1, :].astype(bool), axis=1)
+    dx = (float(meta["x_max"]) - float(meta["x_min"])) / max(float(meta["x_res"]), 1.0)
+    dz = (float(meta["z_max"]) - float(meta["z_min"])) / max(float(meta["z_res"]), 1.0)
+    rx = max(1, int(math.ceil(float(margin_m) / max(dx, 1e-6))))
+    rz = max(1, int(math.ceil(float(margin_m) / max(dz, 1e-6))))
+    tensor = torch.from_numpy(obstacle.astype(np.float32))[None, None]
+    dilated = F.max_pool2d(tensor, kernel_size=(2 * rx + 1, 2 * rz + 1), stride=1, padding=(rx, rz))
+    return dilated[0, 0].numpy() > 0.5
 
 
 class DynamicSceneAwareNavigation(nn.Module):
@@ -304,6 +468,73 @@ class DynHSIModel(OriginalHSIBase):
         joints[..., 2] = joints[..., 2] * meta[:, None, None, 1]
         return joints.reshape(x.shape[0], x.shape[1], -1)
 
+    def _astar_future_trajectory(
+        self,
+        batch: dict[str, Any],
+        current_local: torch.Tensor,
+        goal_local: torch.Tensor,
+        horizon: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = current_local.device
+        dtype = current_local.dtype
+        B = int(current_local.shape[0])
+        anchor_root = batch["anchor_root"].to(device=device, dtype=dtype)
+        world_to_local = batch["world_to_local"].to(device=device, dtype=dtype)
+        current_world = _world_from_local(current_local, anchor_root, world_to_local).detach().cpu().numpy()
+        if "body_goal_world" in batch:
+            goal_world = batch["body_goal_world"].to(device=device, dtype=dtype).detach().cpu().numpy()
+        else:
+            goal_world = _world_from_local(goal_local, anchor_root, world_to_local).detach().cpu().numpy()
+        anchor_np = anchor_root.detach().cpu().numpy()
+        world_to_local_np = world_to_local.detach().cpu().numpy()
+        paths = torch.zeros((B, int(horizon), 3), device=device, dtype=dtype)
+        valid = torch.zeros((B,), device=device, dtype=torch.bool)
+        scene_paths = list(batch.get("scene_occ_path", [""] * B))
+        grid_meta = list(batch.get("grid_meta", [{} for _ in range(B)]))
+        for i in range(B):
+            path_str = str(scene_paths[i]) if i < len(scene_paths) else ""
+            meta = grid_meta[i] if i < len(grid_meta) and isinstance(grid_meta[i], dict) else {}
+            if not path_str or not meta:
+                continue
+            try:
+                occ = np.load(repo_path(path_str), mmap_mode="r")
+                obstacle = _build_obstacle_xz(occ, meta, margin_m=0.25)
+                start_idx = _grid_index(current_world[i, [0, 2]], meta)
+                goal_idx = _grid_index(goal_world[i, [0, 2]], meta)
+                path_idx = _astar(obstacle, start_idx, goal_idx)
+                if path_idx is None or len(path_idx) <= 0:
+                    continue
+                path_xz = np.stack([_world_xz(node, meta) for node in path_idx], axis=0)
+                future_xz = _resample_path(path_xz, int(horizon))
+                y = np.linspace(float(current_world[i, 1]), float(goal_world[i, 1]), int(horizon), dtype=np.float32)
+                future_world = np.stack([future_xz[:, 0], y, future_xz[:, 1]], axis=-1)
+                future_local = _local_from_world(future_world, anchor_np[i], world_to_local_np[i])
+                paths[i] = torch.as_tensor(future_local, device=device, dtype=dtype)
+                valid[i] = True
+            except Exception:
+                continue
+        return paths, valid
+
+    def _prime_from_memory(
+        self,
+        x: torch.Tensor,
+        history: torch.Tensor,
+        batch: dict[str, Any],
+        scene: torch.Tensor,
+        text: torch.Tensor,
+    ) -> torch.Tensor:
+        texts = batch.get("text", [""] * x.shape[0])
+        values = x.clone()
+        for i in range(int(x.shape[0])):
+            retrieved = self.memory.retrieve(str(texts[i] if i < len(texts) else ""), scene[i], text[i])
+            if retrieved is None:
+                continue
+            motion = retrieved.to(device=x.device, dtype=x.dtype)
+            if tuple(motion.shape) != tuple(x[i].shape):
+                continue
+            values[i] = motion * (1.0 - history[i]) + x[i] * history[i]
+        return values
+
     @torch.no_grad()
     def sample(
         self,
@@ -323,10 +554,16 @@ class DynHSIModel(OriginalHSIBase):
         goal = batch["body_goal"].to(device=device, dtype=torch.float32)
         text = batch["text_emb"].to(device=device, dtype=torch.float32)
         scene = batch["scene_occ"].to(device=device, dtype=torch.float32)[:, :32]
+        x = self._prime_from_memory(x, history, batch, scene, text)
         prev_scene = torch.zeros_like(scene)
         nav_traj, nav_conf = self.navigation(pelvis[:, self.history_frames - 1], goal, text, scene, prev_scene, horizon=T - self.history_frames)
-        pad_traj = torch.cat([pelvis[:, : self.history_frames], nav_traj], dim=1)
-        pad_conf = torch.cat([torch.ones(B, self.history_frames, device=device), nav_conf], dim=1)
+        astar_traj, astar_valid = self._astar_future_trajectory(batch, pelvis[:, self.history_frames - 1], goal, horizon=T - self.history_frames)
+        nav_weight = nav_conf[..., None].clamp(0.0, 1.0)
+        astar_mask = astar_valid[:, None, None]
+        future_traj = torch.where(astar_mask, nav_weight * nav_traj + (1.0 - nav_weight) * astar_traj, nav_traj)
+        future_conf = torch.where(astar_valid[:, None], torch.maximum(nav_conf, torch.full_like(nav_conf, 0.5)), nav_conf)
+        pad_traj = torch.cat([pelvis[:, : self.history_frames], future_traj], dim=1)
+        pad_conf = torch.cat([torch.ones(B, self.history_frames, device=device), future_conf], dim=1)
 
         terms = self._ddpm_terms(device)
         for step in self._sampling_steps(num_steps, device):
