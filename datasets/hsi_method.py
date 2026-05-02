@@ -41,13 +41,31 @@ class HSIMethodSpec:
 
 HSI_METHOD_SPECS: dict[str, HSIMethodSpec] = {
     "lingo": HSIMethodSpec(name="lingo", history_frames=2, window_frames=16),
-    "trumans": HSIMethodSpec(name="trumans", history_frames=2, window_frames=32),
-    "dyn_hsi": HSIMethodSpec(name="dyn_hsi", history_frames=2, window_frames=48),
+    "trumans": HSIMethodSpec(name="trumans", history_frames=2, window_frames=16),
+    "dyn_hsi": HSIMethodSpec(name="dyn_hsi", history_frames=2, window_frames=16),
 }
+
+
+TRUMANS_JOINT28_TO_ORIGINAL24 = list(range(22)) + [24, 26]
 
 
 def load_json(path: Path) -> Any:
     return json.loads(path.read_text())
+
+
+def stable_text_feature(text: str, dim: int = 768) -> np.ndarray:
+    seed = stable_hash_bucket(str(text), 2**31 - 1)
+    rng = np.random.default_rng(seed)
+    values = rng.standard_normal(int(dim)).astype(np.float32)
+    values /= max(float(np.linalg.norm(values)), 1e-6)
+    return values[None]
+
+
+def stable_action_label(goal_type: str, frames: int, num_actions: int = 10) -> np.ndarray:
+    idx = stable_hash_bucket(str(goal_type), int(num_actions))
+    out = np.zeros((int(frames), int(num_actions)), dtype=np.float32)
+    out[:, idx] = 1.0
+    return out
 
 
 def scene_ref(scene_payload: dict[str, Any]) -> dict[str, Any]:
@@ -145,6 +163,8 @@ class HSIUnifiedDataset(Dataset):
 
     @property
     def motion_dim(self) -> int:
+        if self.method == "trumans":
+            return len(TRUMANS_JOINT28_TO_ORIGINAL24) * 3
         return JOINTS28_DIM
 
     @property
@@ -318,6 +338,17 @@ class HSIUnifiedDataset(Dataset):
             "hand_goal": torch.from_numpy(hand_goal_local.astype(np.float32)),
             "body_goal_cond": torch.from_numpy(normalize_xyz(body_goal_local[None], self.coord_norm_meta)[0].astype(np.float32)),
             "hand_goal_cond": torch.from_numpy(normalize_xyz(hand_goal_local[None], self.coord_norm_meta)[0].astype(np.float32)),
+            "text_emb": torch.from_numpy(stable_text_feature(record.get("text", "")).astype(np.float32)),
+            "action_label": torch.from_numpy(stable_action_label(record.get("goal_type", ""), self.window_frames).astype(np.float32)),
+            "coord_norm_meta": torch.tensor(
+                [
+                    float(self.coord_norm_meta["x_scale"]),
+                    float(self.coord_norm_meta["z_scale"]),
+                    float(self.coord_norm_meta["y_center"]),
+                    float(self.coord_norm_meta["y_scale"]),
+                ],
+                dtype=torch.float32,
+            ),
             "goal_valid": torch.tensor([1.0, hand_valid], dtype=torch.float32),
             "task_id": torch.tensor(0 if is_loco else 1, dtype=torch.long),
             "text_id": torch.tensor(stable_hash_bucket(record.get("text", ""), 4096), dtype=torch.long),
@@ -340,12 +371,15 @@ class HSIUnifiedDataset(Dataset):
             "segment_id": str(record.get("segment_id", "")),
             "goal_type": str(record.get("goal_type", "")),
             "text": str(record.get("text", "")),
+            "scene_occ_path": str((record.get("scene") or {}).get("occupancy_grid_path") or ""),
+            "grid_meta": (record.get("scene") or {}).get("grid_meta") or {},
         }
 
 
 def hsi_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     tensor_keys = [key for key, value in batch[0].items() if isinstance(value, torch.Tensor)]
     out: dict[str, Any] = {key: torch.stack([item[key] for item in batch], dim=0) for key in tensor_keys}
-    for key in ["dataset_name", "scene_id", "sequence_id", "segment_id", "goal_type", "text"]:
+    for key in ["dataset_name", "scene_id", "sequence_id", "segment_id", "goal_type", "text", "scene_occ_path", "grid_meta"]:
         out[key] = [str(item.get(key, "")) for item in batch]
+    out["grid_meta"] = [item.get("grid_meta") or {} for item in batch]
     return out

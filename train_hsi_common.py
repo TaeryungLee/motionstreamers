@@ -12,16 +12,22 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from datasets.hsi_method import HSI_METHOD_SPECS, HSIUnifiedDataset, hsi_collate_fn
 from models.methods import build_hsi_method_model
 from train_stage2 import build_lr_scheduler, worker_kwargs
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 
 def output_root(args: argparse.Namespace) -> Path:
     return Path("outputs") / str(args.run_name)
+
+
+def resolve_project_path(path: Path) -> Path:
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 class TextLogger:
@@ -116,6 +122,8 @@ def loss_step(
     sqrt_one_minus_alpha_bar: torch.Tensor,
     args: argparse.Namespace,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    if hasattr(model, "loss_step"):
+        return model.loss_step(batch, args)
     x0 = batch["motion"]
     B = x0.shape[0]
     t = torch.randint(0, int(args.num_diffusion_steps), (B,), device=x0.device, dtype=torch.long)
@@ -160,6 +168,159 @@ def evaluate(
             sums[key] = sums.get(key, 0.0) + float(value)
         count += 1
     return {key: value / max(count, 1) for key, value in sums.items()}
+
+
+def sampled_motion_metrics(pred_raw: torch.Tensor, gt_raw: torch.Tensor, batch: dict[str, Any]) -> dict[str, float]:
+    pred = pred_raw.detach().float().cpu()
+    gt = gt_raw.detach().float().cpu()
+    mask = (batch["target_mask"].detach().float().cpu() * batch["valid_mask"].detach().float().cpu()).clamp(0.0, 1.0)
+    denom = mask.sum().clamp_min(1.0)
+    values = (pred - gt).square().mean(dim=-1).sqrt()
+    motion_rmse = (values * mask).sum() / denom
+
+    pred_root = pred.reshape(pred.shape[0], pred.shape[1], 28, 3)[:, :, 0]
+    gt_root = gt.reshape(gt.shape[0], gt.shape[1], 28, 3)[:, :, 0]
+    root_dist = (pred_root - gt_root).square().sum(dim=-1).sqrt()
+    root_rmse = (root_dist * mask).sum() / denom
+
+    if pred.shape[1] > 1:
+        vel_mask = mask[:, 1:] * mask[:, :-1]
+        vel_denom = vel_mask.sum().clamp_min(1.0)
+        pred_vel = pred_root[:, 1:] - pred_root[:, :-1]
+        gt_vel = gt_root[:, 1:] - gt_root[:, :-1]
+        vel_rmse = ((pred_vel - gt_vel).square().sum(dim=-1).sqrt() * vel_mask).sum() / vel_denom
+    else:
+        vel_rmse = torch.tensor(0.0)
+
+    transitions = []
+    history_frames = batch["history_frames"].detach().cpu().long()
+    for i in range(pred.shape[0]):
+        h = int(history_frames[i].item())
+        if 0 < h < pred.shape[1]:
+            transitions.append((pred[i, h] - gt[i, h]).square().mean())
+    transition = torch.stack(transitions).mean() if transitions else torch.tensor(0.0)
+    return {
+        "sample_motion_rmse_mm": float(motion_rmse.item() * 1000.0),
+        "sample_root_rmse_mm": float(root_rmse.item() * 1000.0),
+        "sample_root_vel_rmse_mm_per_frame": float(vel_rmse.item() * 1000.0),
+        "sample_transition_mse": float(transition.item()),
+    }
+
+
+@torch.no_grad()
+def render_eval_visualizations(
+    model: torch.nn.Module,
+    dataset: HSIUnifiedDataset,
+    device: torch.device,
+    args: argparse.Namespace,
+    step: int,
+    logger: TextLogger,
+    writer: Any,
+) -> None:
+    if bool(args.no_eval_vis) or int(args.eval_vis_samples) <= 0:
+        return
+    if not hasattr(model, "sample"):
+        logger.write(f"eval vis skipped step={step}: model has no sample()")
+        return
+    try:
+        from vis.stage2_eval_render import render_stage2_pair
+    except Exception as exc:
+        logger.write(f"eval vis import failed step={step}: {type(exc).__name__}: {exc}")
+        return
+
+    model.eval()
+    out_root = output_root(args) / "eval_vis" / f"step_{int(step):08d}"
+    rng = random.Random(int(args.seed) + int(step))
+    num_items = len(dataset)
+    if num_items <= 0:
+        return
+    num_candidates = min(num_items, max(int(args.eval_vis_samples), int(args.eval_vis_batch_size)))
+    indices = rng.sample(range(num_items), num_candidates)
+    vis_loader = DataLoader(
+        Subset(dataset, indices),
+        batch_size=int(args.eval_vis_batch_size),
+        shuffle=False,
+        num_workers=int(args.num_workers),
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=hsi_collate_fn,
+        drop_last=False,
+        **worker_kwargs(args),
+    )
+    sample_steps = int(args.eval_vis_sampling_steps)
+    if sample_steps <= 0:
+        sample_steps = int(args.num_diffusion_steps)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(args.seed) + int(step))
+
+    saved = 0
+    metric_sums: dict[str, float] = {}
+    metric_batches = 0
+    for batch in vis_loader:
+        if saved >= int(args.eval_vis_samples):
+            break
+        batch = move_to_device(batch, device)
+        try:
+            sample = model.sample(batch, num_steps=sample_steps, generator=generator)
+        except Exception as exc:
+            logger.write(f"eval vis sampling failed step={step}: {type(exc).__name__}: {exc}")
+            return
+        pred_raw = sample["pred_raw"].detach().cpu()
+        gt_raw = sample["gt_raw"].detach().cpu()
+        metric_batch = dict(batch)
+        for key, value in metric_batch.items():
+            if isinstance(value, torch.Tensor):
+                metric_batch[key] = value.detach().cpu()
+        for key, value in sampled_motion_metrics(pred_raw, gt_raw, metric_batch).items():
+            metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+        metric_batches += 1
+
+        lengths = batch["length"].detach().cpu().long()
+        for local_idx in range(pred_raw.shape[0]):
+            if saved >= int(args.eval_vis_samples):
+                break
+            length = int(lengths[local_idx].item())
+            sample_dataset = batch.get("dataset_name", [args.dataset] * pred_raw.shape[0])[local_idx]
+            meta = {
+                "dataset": sample_dataset,
+                "training_dataset": args.dataset,
+                "method": args.method,
+                "step": int(step),
+                "sample_index": int(saved),
+                "scene_id": batch["scene_id"][local_idx],
+                "sequence_id": batch["sequence_id"][local_idx],
+                "segment_id": batch["segment_id"][local_idx],
+                "goal_type": batch["goal_type"][local_idx],
+                "text": batch["text"][local_idx],
+                "length": length,
+                "sampling_steps": int(sample_steps),
+                "fit_smooth_weight": float(args.eval_vis_fit_smooth_weight),
+            }
+            sample_dir = out_root / f"sample_{saved:03d}"
+            try:
+                render_stage2_pair(
+                    gt_raw[local_idx, :length],
+                    pred_raw[local_idx, :length],
+                    dataset=sample_dataset,
+                    out_dir=sample_dir,
+                    smplx_model_dir=resolve_project_path(Path(args.smplx_model_dir)),
+                    render_device=str(args.eval_vis_device),
+                    image_size=int(args.eval_vis_image_size),
+                    fps=int(args.eval_vis_fps),
+                    frame_stride=int(args.eval_vis_frame_stride),
+                    meta=meta,
+                    anchor_root=batch["anchor_root"][local_idx].detach().cpu(),
+                    world_to_local=batch["world_to_local"][local_idx].detach().cpu(),
+                    fit_smooth_weight=float(args.eval_vis_fit_smooth_weight),
+                )
+            except Exception as exc:
+                logger.write(f"eval vis sample failed step={step} sample={saved}: {type(exc).__name__}: {exc}")
+            saved += 1
+
+    metrics = {key: value / max(metric_batches, 1) for key, value in metric_sums.items()}
+    if metrics:
+        logger.write(f"eval vis metrics step={step} {json.dumps(metrics, sort_keys=True)}")
+        write_scalars(writer, "eval_vis", metrics, step)
+    logger.write(f"eval vis step={step} saved={saved} dir={out_root}")
 
 
 def save_checkpoint(
@@ -240,8 +401,20 @@ def add_common_args(parser: argparse.ArgumentParser, method: str) -> None:
     parser.add_argument("--log-every-steps", type=int, default=2000)
     parser.add_argument("--checkpoint-every-steps", type=int, default=2000)
     parser.add_argument("--max-eval-batches", type=int, default=100)
+    parser.add_argument("--eval-vis-every-steps", type=int, default=0)
+    parser.add_argument("--eval-vis-samples", type=int, default=10)
+    parser.add_argument("--eval-vis-sampling-steps", type=int, default=0)
+    parser.add_argument("--eval-vis-batch-size", type=int, default=10)
+    parser.add_argument("--eval-vis-device", default="cuda")
+    parser.add_argument("--eval-vis-image-size", type=int, default=384)
+    parser.add_argument("--eval-vis-fps", type=int, default=30)
+    parser.add_argument("--eval-vis-frame-stride", type=int, default=1)
+    parser.add_argument("--eval-vis-fit-smooth-weight", type=float, default=0.0)
+    parser.add_argument("--smplx-model-dir", default="human_models")
+    parser.add_argument("--no-eval-vis", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--init-original-checkpoint", type=Path, default=None)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--no-tensorboard", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -284,6 +457,11 @@ def run_training(args: argparse.Namespace) -> None:
         dropout=float(args.dropout),
         num_timesteps=int(args.num_diffusion_steps),
     ).to(device)
+    if args.init_original_checkpoint is not None:
+        if not hasattr(model, "load_original_checkpoint"):
+            raise ValueError(f"{args.method} does not support --init-original-checkpoint")
+        model.load_original_checkpoint(args.init_original_checkpoint, map_location=device)
+        logger.write(f"loaded original checkpoint {args.init_original_checkpoint}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
     total_steps = max(1, len(train_loader) * int(args.epochs))
     scheduler = build_lr_scheduler(args, optimizer, total_steps)
@@ -325,6 +503,11 @@ def run_training(args: argparse.Namespace) -> None:
                     best_metric = metric
                     save_checkpoint(out_dir / "checkpoints" / "best.pt", model, optimizer, scheduler, scaler, args, epoch, global_step, best_metric, train_dataset)
                     logger.write(f"saved best checkpoint step={global_step} metric={best_metric:.6f}")
+                model.train()
+            eval_vis_every = int(args.eval_vis_every_steps) if int(args.eval_vis_every_steps) > 0 else int(args.log_every_steps)
+            if eval_vis_every > 0 and global_step % eval_vis_every == 0:
+                render_eval_visualizations(model, eval_dataset, device, args, global_step, logger, writer)
+                model.train()
             if global_step % int(args.checkpoint_every_steps) == 0:
                 save_checkpoint(out_dir / "checkpoints" / "latest.pt", model, optimizer, scheduler, scaler, args, epoch, global_step, best_metric, train_dataset)
                 logger.write(f"saved latest checkpoint step={global_step}")

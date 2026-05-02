@@ -6,7 +6,7 @@ from train_hsi_common import add_common_args, run_training
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train TRUMANS-style HSI comparison model.")
+    parser = argparse.ArgumentParser(description="Train faithful original TRUMANS/SynHSI comparison model.")
     add_common_args(parser, method="trumans")
     args = parser.parse_args()
     run_training(args)
